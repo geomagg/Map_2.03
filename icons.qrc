@@ -1,0 +1,20 @@
+<RCC>
+    <qresource prefix="/icons">
+        <file>open.png</file>
+        <file>backgroundcolor.png</file>
+        <file>connect.png</file>
+        <file>distance.png</file>
+        <file>fullzoom.png</file>
+        <file>info.png</file>
+        <file>nodes.png</file>
+        <file>pan.png</file>
+        <file>polygon.png</file>
+        <file>quit.png</file>
+        <file>sae.png</file>
+        <file>sail.png</file>
+        <file>shot.png</file>
+        <file>zoomin.png</file>
+        <file>zoomout.png</file>
+    </qresource>
+</RCC>
+

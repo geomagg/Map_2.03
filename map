@@ -1,0 +1,6 @@
+#!/usr/bin/python3
+from qgis.core import QgsApplication
+from Map import Map
+app =QgsApplication([],True)
+Map(app)
+app.exitQgis()
