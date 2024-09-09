@@ -21,13 +21,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("OBN Design")
         self.setGeometry(500, 500, 1400, 800)
         self.project = QgsProject()
-        global lay
-        lay=[]
 #        global curr_dir
 #        curr_dir = os.path.dirname(os.path.realpath(__file__))
         self.initUI()
 
 ### ---- READING  the file shots.txt, nodes.txt, sail.txt, pol2.txt, pol3.txt, grid.txt
+
+        global lay
+        lay=[]
 
         curr_d = os.path.abspath(os.path.realpath(os.curdir))
         print ('curr_d', curr_d)
@@ -84,7 +85,8 @@ class MainWindow(QMainWindow):
         self.map_canvas = QgsMapCanvas()
         self.grid_layout.addWidget(self.map_canvas)
         self.map_canvas.setCanvasColor(QColor(200, 200,200))
-
+#
+#
         # coordinates bar
         self.lblXY = QLabel()
         self.lblXY.setFrameStyle(QFrame.Box )
@@ -153,9 +155,6 @@ class MainWindow(QMainWindow):
         readAct11 = QAction(QIcon(":/icons/sail.png"),'Grid', self)
         readAct11.setShortcut('Ctrl+a')
         readAct11.setStatusTip('Read Grid file')
-
-
-
 
 
         typeMenu.addAction(readAct)
