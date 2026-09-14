@@ -13,13 +13,13 @@ class ConnectTool(QgsMapToolEmitPoint):
     """ Map tool to connect points."""
 
     line_complete = pyqtSignal(QgsPointXY, QgsPointXY)
-    start_point = None
-    end_point = None
-    rubberband = None
 
     def __init__(self, canvas):
         self.canvas = canvas
         QgsMapToolEmitPoint.__init__(self, canvas)
+        self.start_point = None
+        self.end_point = None
+        self.rubberband = None
 
     def canvasMoveEvent(self, event):
         if self.start_point:
@@ -37,12 +37,11 @@ class ConnectTool(QgsMapToolEmitPoint):
     def canvasPressEvent(self, e):
         if self.start_point is None:
             self.start_point = self.toMapCoordinates(e.pos())
-#            print("start point",self.start_point)
         else:
             self.end_point = self.toMapCoordinates(e.pos())
-#            print("end point", self.end_point)
             # kill the rubberband
-            self.rubberband.reset()
+            if self.rubberband:
+                self.rubberband.reset()
             # line is done, emit a signal
             self.line_complete.emit(self.start_point, self.end_point)
             # reset the points
@@ -52,17 +51,14 @@ class ConnectTool(QgsMapToolEmitPoint):
 
 class infoTool(QgsMapToolIdentify):
 
-
     def __init__(self, canvas):
-
-        self.windows =canvas
+        self.windows = canvas
         QgsMapToolIdentify.__init__(self, canvas)
 
     def canvasReleaseEvent(self, event):
         found_features = self.identify(event.x(), event.y(),
                                        self.TopDownStopAtFirst,
                                        self.VectorLayer)
-
 
         if len(found_features) > 0:
             layer = found_features[0].mLayer
@@ -71,10 +67,13 @@ class infoTool(QgsMapToolIdentify):
             info = []
             line = feature.attribute("L")
             station = feature.attribute("S")
-            info.append("Line/Station: %d, %d" % (line, station))
+            print("Line:", line)
+            print("Station:", station)
+
+            info.append("Line/Station: %s, %s" % (line, station))
 
             X = geometry.asPoint().x()
-            Y  = geometry.asPoint().y()
+            Y = geometry.asPoint().y()
             info.append("X/Y: %0.1f, %0.1f" % (X, Y))
 
             QMessageBox.information(self.windows,
