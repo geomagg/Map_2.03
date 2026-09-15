@@ -1,4 +1,4 @@
-import sys,os
+import sys,os,shutil,struct
 from PyQt5.QtWidgets import (QMainWindow,QAction, QMenu, QHBoxLayout, QVBoxLayout,
                              qApp, QApplication, QLabel, QPushButton,QLCDNumber, QSlider, 
                              QGridLayout,QFileDialog, QTextEdit, QFrame, QActionGroup,
@@ -20,6 +20,114 @@ from map_tool import infoTool
 from map_tool import RectSelectTool
 import math
 import icons
+
+# Binary format for the CMP cache file: 4-byte magic + a fixed header
+# (extent + max offset, as 5 doubles) + one 32-byte record (mx,my,offset,
+# azimuth as 4 doubles) per source-receiver pair. Reading/writing raw
+# bytes like this is much faster than parsing a CSV line by line, and the
+# file is smaller on disk too.
+CMP_MAGIC = b'CMP1'
+CMP_HEADER_FMT = '<5d'   # xmin, xmax, ymin, ymax, max_offset
+CMP_HEADER_SIZE = struct.calcsize(CMP_HEADER_FMT)
+CMP_RECORD_FMT = '<4d'   # mx, my, offset, azimuth
+CMP_RECORD_SIZE = struct.calcsize(CMP_RECORD_FMT)
+
+HELP_HTML = """
+<h2>OBN Design -- Manual rapido</h2>
+<p>Ferramenta para desenho e QC de aquisicao sismica OBN: plotagem de nodes,
+shots, sail lines e poligonos de area, alem de calculo de fold, azimute e
+diagramas offset-azimute.</p>
+
+<h3>Barra de ferramentas</h3>
+<ul>
+<li><b>Pan / Zoom in / Zoom out / Full extent</b> -- navegacao basica no mapa.</li>
+<li><b>Connect</b> -- clique em dois pontos no mapa; mostra distancia (km) e
+azimute (graus) entre eles.</li>
+<li><b>Select Area</b> -- arraste um retangulo no mapa; mostra quantos
+<i>nodes</i> e <i>shots</i> caem dentro dele.</li>
+<li><b>Info tool</b> -- clique numa feicao pra ver seus atributos
+(linha/estacao, X/Y).</li>
+</ul>
+
+<h3>Menu Layers</h3>
+<p>Carregar camadas manualmente, por shapefile (<i>Shape_files</i>) ou por
+arquivo texto delimitado (<i>txtfiles</i>): Nodes, Shots, Sail, Grid, Node
+Polygon, Shot Polygon. Os poligonos (pol2/polshot) sao montados
+automaticamente a partir de uma lista ordenada de vertices. Recarregar
+qualquer uma dessas camadas <b>substitui</b> a anterior (nao fica a antiga
+"escondida" por baixo) e ja exibe a nova automaticamente.</p>
+<p><i>nodes.txt</i>, <i>pol2.txt</i> e <i>polshot.txt</i>/<i>pol3.txt</i> sao
+carregados e exibidos automaticamente ao abrir o programa, se estiverem na
+pasta de dados. Shots/Sail/Grid precisam ser carregados manualmente.</p>
+
+<h3>Menu View</h3>
+<p>Checkboxes pra mostrar/esconder cada camada carregada (nodes, shots,
+sail, grid, poligonos, raster de batimetria, fold map, azimuth map).</p>
+
+<h3>Menu Layer Preferences</h3>
+<p>Cor e tamanho de nodes/shots/sail; cor e espessura de linha dos poligonos;
+transparencia e legenda de cores do fold map e do azimuth map.</p>
+
+<h3>Menu Preferences</h3>
+<ul>
+<li><b>Background color</b> -- cor de fundo do canvas.</li>
+<li><b>Diretorio de dados</b> -- pasta padrao aberta pelos dialogos de
+"Open file" do menu Layers. Configure aqui a pasta onde estao seus arquivos
+de nodes/shots/etc, pra nao precisar navegar toda vez.</li>
+</ul>
+
+<h3>Menu Design</h3>
+<ul>
+<li><b>Gerar Nodes (grid no Poligono)</b> -- cria um grid regular de nodes
+dentro do poligono <i>pol2</i> (Node Polygon), a partir do espacamento entre
+nodes na linha (X), espacamento entre linhas (Y), e a direcao das linhas
+(azimute, 0 = Norte). Opcoes adicionais:
+  <ul>
+  <li><i>Incluir nodes na borda</i> -- inclui pontos que caem exatamente em
+  cima do contorno do poligono, alem do interior.</li>
+  <li><i>Alternar (escalonar) entre linhas</i> -- desloca as linhas
+  alternadas em metade do espacamento X (dx/2), gerando um padrao em
+  "tijolo" em vez de um grid retangular alinhado.</li>
+  </ul>
+O resultado e salvo como um novo <i>nodes.txt</i> (voce escolhe onde) e ja
+carregado automaticamente como a camada de nodes.</li>
+</ul>
+
+<h3>Menu Computations</h3>
+<ul>
+<li><b>Fold Map</b> -- mapa de fold (cobertura CMP) por bin, numa faixa de
+offset escolhida (minimo e maximo).</li>
+<li><b>Azimuth Map</b> -- azimute medio (circular) por bin, na mesma logica
+de bins do Fold Map.</li>
+<li><b>Fold Rose (Azimute)</b> -- diagrama polar offset x azimute: angulo =
+azimute (0 = Norte, sentido horario), raio = offset (aneis), cor = fold.
+Requer a biblioteca <i>matplotlib</i> instalada no Python do QGIS.</li>
+<li><b>Arquivo CMP</b> -- cache em disco (formato binario .cmp, compacto e
+rapido de ler/escrever) dos pares fonte-receptor (midpoint, offset,
+azimute). Gerado e atualizado automaticamente na primeira vez que voce
+calcula Fold/Azimuth/Rose; calculos seguintes com offset menor ou igual ao
+ja calculado reaproveitam o arquivo, sem refazer a busca espacial nem
+estourar memoria em levantamentos grandes (os pares sao gravados direto no
+disco conforme sao calculados, nunca ficam todos na RAM de uma vez). O
+cache e reconhecido automaticamente entre sessoes (mesmo fechando e
+reabrindo o programa) e e invalidado sozinho se voce recarregar
+nodes/shots com dados diferentes. Normalmente voce nao precisa mexer
+neste submenu -- ele existe pra quem quiser gerar/salvar/carregar o cache
+manualmente.</li>
+</ul>
+
+<h3>Dica de fluxo de trabalho</h3>
+<ol>
+<li>Configure o <b>Diretorio de dados</b> (Preferences) apontando pra pasta
+dos seus arquivos.</li>
+<li>Carregue Nodes, Shots (e Sail/Grid se precisar) pelo menu Layers -- ou
+use <b>Design > Gerar Nodes</b> pra criar um grid novo dentro do poligono.</li>
+<li>Ajuste cores/tamanhos em Layer Preferences, se quiser.</li>
+<li>Calcule Fold Map, Azimuth Map ou Fold Rose em Computations -- o cache
+
+CMP cuida de deixar os calculos seguintes rapidos.</li>
+</ol>
+"""
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -49,9 +157,12 @@ class MainWindow(QMainWindow):
         self.foldRanges = []
         self.azimuthOpacity = 0.6
         self.azimuthRanges = []
-        self.cmp_table = None       # cached list of (mx, my, offset, azimuth)
-        self.cmp_max_offset = None  # max offset covered by self.cmp_table
+        self.cmp_file = None        # path to the on-disk CMP cache (mx,my,offset,azimuth), or None
+        self.cmp_max_offset = None  # max offset covered by self.cmp_file
         self.cmp_extent = None      # (xmin, xmax, ymin, ymax) of nodes+shots, for stable binning
+        self.pairs_error = None
+        self.pairs_canceled = False
+        self.pairs_from_cache = False
 
         self.initUI()
 
@@ -105,6 +216,10 @@ class MainWindow(QMainWindow):
         self.actShowPolNodeLayer.setChecked(True)
         self.actShowPolShotLayer.setChecked(True)
         self.showVisibleMapLayers()
+
+        # reuse a CMP cache left over from a previous run, if one exists
+        # in the data folder (silent -- no popup at startup)
+        self._tryAutoLoadCMPCache(notify=False)
 
 ###-----------------------------------------------------------------------------------------
 
@@ -502,12 +617,20 @@ class MainWindow(QMainWindow):
 
         computationsMenu.addMenu(cmpMenu)
 
+        # Design
+        designMenu = menubar.addMenu('&Design')
+
+        designNodesAct = QAction(QIcon(":/icons/polygon.png"), 'Gerar Nodes (grid no Poligono)', self)
+        designNodesAct.setStatusTip('Generate a regular nodes grid inside the pol2 (Node Polygon) boundary')
+        designMenu.addAction(designNodesAct)
+        designNodesAct.triggered.connect(self.designNodesGrid)
+
         # Help
         helpMenu = menubar.addMenu('&Help')
-        helpAct = QAction(QIcon('backgroundcolor.png'), 'About', self)
-        helpAct.setStatusTip('Help')
+        helpAct = QAction(QIcon(":/icons/info.png"), 'Manual / Ajuda', self)
+        helpAct.setStatusTip('Ver o manual de uso do programa')
         helpMenu.addAction(helpAct)
- #       helpAct.triggered.connect(self.xxxxxx)
+        helpAct.triggered.connect(self.showHelp)
 
 # Tool bar
 
@@ -613,6 +736,14 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         lay.append(new_layer)
+
+        if name in ('nodes', 'shots'):
+            # the CMP cache (fold/azimuth/rose) was computed from the
+            # previous nodes/shots geometry -- it's now stale, so drop it
+            # rather than silently reusing wrong results
+            self.cmp_file = None
+            self.cmp_max_offset = None
+            self.cmp_extent = None
 
     def toPolygonLayer(self, point_layer, name):
         """ Build a single closed polygon from an ordered set of vertex points
@@ -808,7 +939,9 @@ class MainWindow(QMainWindow):
            (name, ext) = os.path.basename(path[0]).split('.')
            layer = QgsVectorLayer(path[0], 'nodes', 'ogr')
            if layer.isValid():
-             lay.append(layer)
+             self.replaceLayerInLay('nodes', layer)
+             self.actShowNodesLayer.setChecked(True)
+             self.showVisibleMapLayers()
              QMessageBox.about(self, "LAYER LOADED", "Nodes shapefile loaded")
            else:
              QMessageBox.about(self, "LAYER NOT LOADED", "Nodes shapefile NOT loaded")
@@ -818,7 +951,9 @@ class MainWindow(QMainWindow):
         if path[0]:
            layer = QgsVectorLayer(path[0], 'shots', 'ogr')
            if layer.isValid():
-             lay.append(layer)
+             self.replaceLayerInLay('shots', layer)
+             self.actShowShotsLayer.setChecked(True)
+             self.showVisibleMapLayers()
              QMessageBox.about(self, "LAYER LOADED!", "Shots shapefile loaded")
            else:
              QMessageBox.about(self, "LAYER NOT LOADED", "Shot shapefile NOT loaded")
@@ -828,7 +963,9 @@ class MainWindow(QMainWindow):
         if path[0]:
            layer = QgsVectorLayer(path[0], 'sail', 'ogr')
            if layer.isValid():
-             lay.append(layer)
+             self.replaceLayerInLay('sail', layer)
+             self.actShowSailLayer.setChecked(True)
+             self.showVisibleMapLayers()
              QMessageBox.about(self, "LAYER LOADED!", "Sail shapefile loaded")
            else:
              QMessageBox.about(self, "LAYER NOT LOADED", "Sail shapefile NOT loaded")
@@ -838,7 +975,9 @@ class MainWindow(QMainWindow):
         if path[0]:
            layer = QgsVectorLayer(path[0], 'grid', 'ogr')
            if layer.isValid():
-             lay.append(layer)
+             self.replaceLayerInLay('grid', layer)
+             self.actShowGridLayer.setChecked(True)
+             self.showVisibleMapLayers()
              QMessageBox.about(self, "LAYER LOADED!", "Grid shapefile loaded")
            else:
              QMessageBox.about(self, "LAYER NOT LOADED", "Grid shapefile NOT loaded")
@@ -892,14 +1031,13 @@ class MainWindow(QMainWindow):
     def txtNodesInput(self):
        path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
        if path[0]:
-         print ('CXXXXXXXXXXXXXX CARALHO WWWWWW', curr_dir)
-         filename = "file://"+path[0]   # os.path.join(cur_dir, ProJect, "nodes.txt")
-         print ('filename', filename, path[0])
+         filename = "file://"+path[0]
          uri=filename+"?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
          layer = QgsVectorLayer(uri, "nodes", "delimitedtext")
          if layer.isValid():
-             lay.append(layer)
-             print(layer.name())
+             self.replaceLayerInLay('nodes', layer)
+             self.actShowNodesLayer.setChecked(True)
+             self.showVisibleMapLayers()
              QMessageBox.about(self, "LAYER LOADED!", "Nodes txt layer  loaded")
          else:
              QMessageBox.about(self, "LAYER NOT LOADED", "Nodes txt-delimited NOT loaded")
@@ -911,7 +1049,9 @@ class MainWindow(QMainWindow):
            uri=filename+"?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
            layer = QgsVectorLayer(uri, "shots", "delimitedtext")
            if layer.isValid():
-             lay.append(layer)
+             self.replaceLayerInLay('shots', layer)
+             self.actShowShotsLayer.setChecked(True)
+             self.showVisibleMapLayers()
              QMessageBox.about(self, "LAYER LOADED!", "Shots txt layer  loaded")
            else:
              QMessageBox.about(self, "LAYER NOT LOADED", "Shots txt-delimited NOT loaded")
@@ -923,7 +1063,9 @@ class MainWindow(QMainWindow):
            uri=filename+"?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
            layer = QgsVectorLayer(uri, "sail", "delimitedtext")
            if layer.isValid():
-             lay.append(layer)
+             self.replaceLayerInLay('sail', layer)
+             self.actShowSailLayer.setChecked(True)
+             self.showVisibleMapLayers()
              QMessageBox.about(self, "LAYER LOADED!", "Sail txt layer  loaded")
            else:
              QMessageBox.about(self, "LAYER NOT LOADED", "Sail txt-delimited NOT loaded")
@@ -935,7 +1077,9 @@ class MainWindow(QMainWindow):
            uri=filename+"?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
            layer = QgsVectorLayer(uri, "grid", "delimitedtext")
            if layer.isValid():
-             lay.append(layer)
+             self.replaceLayerInLay('grid', layer)
+             self.actShowGridLayer.setChecked(True)
+             self.showVisibleMapLayers()
              QMessageBox.about(self, "LAYER LOADED!", "Grid txt layer  loaded")
            else:
              QMessageBox.about(self, "LAYER NOT LOADED", "Grid txt-delimited NOT loaded")
@@ -1068,12 +1212,80 @@ class MainWindow(QMainWindow):
 
           self.map_canvas.setCanvasColor(QColor(col))
 
+    def _readCMPHeader(self, path):
+        """ Read just the metadata header of a CMP cache file (binary
+        format): returns (extent, max_offset, count) where extent is
+        (xmin,xmax,ymin,ymax) or None, max_offset is a float or None, and
+        count is the number of pair records in the file (computed from
+        the file size -- no need to scan the records). Returns
+        (None, None, 0) on any read error or if the file isn't a
+        recognized CMP cache file. """
+        try:
+            with open(path, 'rb') as f:
+                magic = f.read(len(CMP_MAGIC))
+                if magic != CMP_MAGIC:
+                    return None, None, 0
+                header_bytes = f.read(CMP_HEADER_SIZE)
+                if len(header_bytes) < CMP_HEADER_SIZE:
+                    return None, None, 0
+                xmin, xmax, ymin, ymax, max_offset = struct.unpack(CMP_HEADER_FMT, header_bytes)
+            total_size = os.path.getsize(path)
+            data_size = total_size - len(CMP_MAGIC) - CMP_HEADER_SIZE
+            count = max(0, data_size // CMP_RECORD_SIZE)
+            return (xmin, xmax, ymin, ymax), max_offset, count
+        except Exception:
+            return None, None, 0
+
+    def _tryAutoLoadCMPCache(self, notify=False):
+        """ If <data_dir>/cmp_cache.cmp exists, adopt it as the current CMP
+        cache (self.cmp_file/self.cmp_max_offset/self.cmp_extent) so it is
+        reused instead of silently ignored -- this is what lets the cache
+        survive across app restarts, since only the in-memory reference
+        (not the file itself) is lost when the app closes. """
+        candidate = os.path.join(self.data_dir, "cmp_cache.cmp")
+        if not os.path.exists(candidate):
+            return False
+
+        extent, max_offset_cap, count = self._readCMPHeader(candidate)
+        if count == 0 or max_offset_cap is None:
+            return False
+
+        self.cmp_file = candidate
+        self.cmp_extent = extent
+        self.cmp_max_offset = max_offset_cap
+
+        if notify:
+            QMessageBox.information(self, "Arquivo CMP",
+                "Cache CMP encontrado e carregado automaticamente:\n%s\n\n"
+                "%d pares, offset maximo = %.1f m"
+                % (candidate, count, max_offset_cap))
+        return True
+
     def setDataDir(self):
         new_dir = QFileDialog.getExistingDirectory(self,
             "Escolha a pasta com seus arquivos (nodes, shots, sail, etc.)",
             self.data_dir, options=QFileDialog.DontUseNativeDialog)
         if new_dir:
             self.data_dir = new_dir
+            self._tryAutoLoadCMPCache(notify=True)
+
+    def showHelp(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Ajuda - OBN Design")
+        dialog.resize(700, 600)
+        layout = QVBoxLayout(dialog)
+
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setHtml(HELP_HTML)
+        layout.addWidget(text)
+
+        close_btn = QPushButton("Fechar")
+        close_btn.clicked.connect(dialog.close)
+        layout.addWidget(close_btn)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
 
     def colorLayerDialog(self):
 
@@ -1219,28 +1431,61 @@ class MainWindow(QMainWindow):
        """ SLOT. Show scale """
        self.lblScale.setText( "Scale 1:" + str(round(scale)) )
 
-    def getSourceReceiverPairs(self, min_offset, max_offset, progress_title="Calculando..."):
-        """ Return (pairs, canceled, error) where pairs is a list of
-        (mx, my, offset, azimuth) tuples for every node-shot pair with
-        min_offset <= offset <= max_offset. Reuses the cached CMP table
-        (self.cmp_table / self.cmp_extent) when it already covers
-        max_offset, avoiding a full recomputation; otherwise computes
-        directly from the 'nodes'/'shots' layers (with a progress dialog).
-        This fresh computation is NOT cached into self.cmp_table -- use
-        Computations > Arquivo CMP > Gerar arquivo CMP for that. """
+    def getSourceReceiverPairs(self, min_offset, max_offset, progress_title="Calculando...", cache_path=None):
+        """ Generator yielding (mx, my, offset, azimuth) tuples for every
+        node-shot pair with min_offset <= offset <= max_offset.
 
-        if (self.cmp_table is not None and self.cmp_max_offset is not None
-                and max_offset <= self.cmp_max_offset):
-            pairs = [p for p in self.cmp_table if min_offset <= p[2] <= max_offset]
-            return pairs, False, None
+        Memory-safe for very large surveys: pairs are streamed one at a
+        time, never all held in memory at once, and the on-disk cache is
+        a compact binary format (fast to read/write, no text parsing).
+
+        - If an on-disk CMP cache (self.cmp_file) already covers
+          max_offset, pairs are streamed back from that file (filtered by
+          offset), without touching the nodes/shots layers again.
+        - Otherwise, pairs are computed fresh from the nodes/shots layers
+          (via a spatial index) and, in the same pass, streamed straight
+          to a new CMP cache file on disk (cache_path, defaulting to
+          <data_dir>/cmp_cache.cmp) -- so every Fold/Azimuth/Rose
+          calculation doubles as "Gerar arquivo CMP" automatically.
+
+        After exhausting the generator, check self.pairs_error (a message
+        string, or None), self.pairs_canceled (bool) and
+        self.pairs_from_cache (bool) to know the outcome. """
+
+        self.pairs_error = None
+        self.pairs_canceled = False
+        self.pairs_from_cache = False
+
+        if (self.cmp_file and self.cmp_max_offset is not None
+                and max_offset <= self.cmp_max_offset
+                and os.path.exists(self.cmp_file)):
+            self.pairs_from_cache = True
+            try:
+                with open(self.cmp_file, 'rb') as f:
+                    magic = f.read(len(CMP_MAGIC))
+                    if magic != CMP_MAGIC:
+                        raise ValueError("formato de arquivo CMP invalido ou incompativel")
+                    f.read(CMP_HEADER_SIZE)   # already known via self.cmp_extent/self.cmp_max_offset
+                    while True:
+                        chunk = f.read(CMP_RECORD_SIZE)
+                        if len(chunk) < CMP_RECORD_SIZE:
+                            break
+                        mx, my, offset, azimuth = struct.unpack(CMP_RECORD_FMT, chunk)
+                        if min_offset <= offset <= max_offset:
+                            yield (mx, my, offset, azimuth)
+            except Exception as e:
+                self.pairs_error = "Erro ao ler o cache CMP (%s): %s" % (self.cmp_file, str(e))
+            return
 
         nodes_layer = next((x for x in lay if x.name() == 'nodes'), None)
         shots_layer = next((x for x in lay if x.name() == 'shots'), None)
 
         if not nodes_layer or not shots_layer:
-            return None, False, "Carregue as camadas de Nodes e Shots antes de calcular."
+            self.pairs_error = "Carregue as camadas de Nodes e Shots antes de calcular."
+            return
         if not nodes_layer.isValid() or not shots_layer.isValid():
-            return None, False, "As camadas de Nodes e/ou Shots nao sao validas."
+            self.pairs_error = "As camadas de Nodes e/ou Shots nao sao validas."
+            return
 
         node_pts = [f.geometry().asPoint() for f in nodes_layer.getFeatures()
                    if f.geometry() and not f.geometry().isEmpty()]
@@ -1248,7 +1493,8 @@ class MainWindow(QMainWindow):
                    if f.geometry() and not f.geometry().isEmpty()]
 
         if not node_pts or not shot_pts:
-            return None, False, "As camadas de Nodes/Shots estao vazias."
+            self.pairs_error = "As camadas de Nodes/Shots estao vazias."
+            return
 
         index = QgsSpatialIndex()
         node_feats = []
@@ -1262,43 +1508,67 @@ class MainWindow(QMainWindow):
         all_y = [p.y() for p in node_pts] + [p.y() for p in shot_pts]
         self.cmp_extent = (min(all_x), max(all_x), min(all_y), max(all_y))
 
-        pairs = []
+        if cache_path is None:
+            cache_path = os.path.join(self.data_dir, "cmp_cache.cmp")
+
+        cache_f = None
+        try:
+            cache_f = open(cache_path, 'wb')
+            cache_f.write(CMP_MAGIC)
+            cache_f.write(struct.pack(CMP_HEADER_FMT,
+                self.cmp_extent[0], self.cmp_extent[1],
+                self.cmp_extent[2], self.cmp_extent[3], max_offset))
+        except Exception:
+            cache_f = None   # if the cache file can't be written, still compute normally
+
         progress = QProgressDialog(progress_title, "Cancelar", 0, len(shot_pts), self)
         progress.setWindowTitle("Calculando")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
 
-        canceled = False
-        for i, sp in enumerate(shot_pts):
-            if i % 20 == 0:
-                progress.setValue(i)
-                if progress.wasCanceled():
-                    canceled = True
-                    break
-            rect = QgsRectangle(sp.x() - max_offset, sp.y() - max_offset,
-                                sp.x() + max_offset, sp.y() + max_offset)
-            for nid in index.intersects(rect):
-                np_ = node_pts[nid]
-                dx = np_.x() - sp.x()
-                dy = np_.y() - sp.y()
-                offset = math.hypot(dx, dy)
-                if offset > max_offset or offset < min_offset:
-                    continue
-                mx = (sp.x() + np_.x()) / 2.0
-                my = (sp.y() + np_.y()) / 2.0
-                azimuth = math.degrees(math.atan2(dx, dy))
-                if azimuth < 0:
-                    azimuth += 360.0
-                pairs.append((mx, my, offset, azimuth))
-
-        progress.setValue(len(shot_pts))
-        return pairs, canceled, None
+        try:
+            for i, sp in enumerate(shot_pts):
+                if i % 20 == 0:
+                    progress.setValue(i)
+                    if progress.wasCanceled():
+                        self.pairs_canceled = True
+                        break
+                rect = QgsRectangle(sp.x() - max_offset, sp.y() - max_offset,
+                                    sp.x() + max_offset, sp.y() + max_offset)
+                for nid in index.intersects(rect):
+                    np_ = node_pts[nid]
+                    dx = np_.x() - sp.x()
+                    dy = np_.y() - sp.y()
+                    offset = math.hypot(dx, dy)
+                    if offset > max_offset or offset < min_offset:
+                        continue
+                    mx = (sp.x() + np_.x()) / 2.0
+                    my = (sp.y() + np_.y()) / 2.0
+                    azimuth = math.degrees(math.atan2(dx, dy))
+                    if azimuth < 0:
+                        azimuth += 360.0
+                    if cache_f:
+                        cache_f.write(struct.pack(CMP_RECORD_FMT, mx, my, offset, azimuth))
+                    yield (mx, my, offset, azimuth)
+            progress.setValue(len(shot_pts))
+        finally:
+            if cache_f:
+                cache_f.close()
+                if not self.pairs_canceled and not self.pairs_error:
+                    self.cmp_file = cache_path
+                    self.cmp_max_offset = max_offset
+                else:
+                    try:
+                        os.remove(cache_path)
+                    except OSError:
+                        pass
 
     def buildCMPTable(self):
-        """ Compute and cache ALL node-shot pairs (mx, my, offset, azimuth)
-        up to a chosen max offset. Any Fold/Azimuth/Rose calculation done
-        afterwards with max offset <= this cap reuses the cache instead of
-        recomputing the full spatial search. """
+        """ Compute ALL node-shot pairs (mx, my, offset, azimuth) up to a
+        chosen max offset, streaming them straight to a CSV file on disk
+        (never holding the full set in memory). Any Fold/Azimuth/Rose
+        calculation done afterwards with max offset <= this cap reuses the
+        file instead of recomputing the full spatial search. """
 
         max_offset, ok = QInputDialog.getDouble(self, "Arquivo CMP",
             "Offset maximo a incluir no arquivo CMP (m):\n"
@@ -1308,113 +1578,262 @@ class MainWindow(QMainWindow):
         if not ok:
             return
 
-        old_table, old_cap = self.cmp_table, self.cmp_max_offset
-        self.cmp_table, self.cmp_max_offset = None, None
-
-        pairs, canceled, err = self.getSourceReceiverPairs(
-            0.0, max_offset, "Gerando arquivo CMP...")
-
-        if err:
-            self.cmp_table, self.cmp_max_offset = old_table, old_cap
-            QMessageBox.warning(self, "Arquivo CMP", err)
+        default_path = os.path.join(self.data_dir, "cmp_cache.cmp")
+        path, _ = QFileDialog.getSaveFileName(self, "Salvar arquivo CMP", default_path,
+            "Arquivo CMP (*.cmp)", options=QFileDialog.DontUseNativeDialog)
+        if not path:
             return
-        if canceled:
-            self.cmp_table, self.cmp_max_offset = old_table, old_cap
+        if not path.lower().endswith('.cmp'):
+            path += '.cmp'
+
+        old_file, old_cap = self.cmp_file, self.cmp_max_offset
+        self.cmp_file, self.cmp_max_offset = None, None   # force a fresh computation
+
+        count = 0
+        for _ in self.getSourceReceiverPairs(0.0, max_offset, "Gerando arquivo CMP...", cache_path=path):
+            count += 1
+
+        if self.pairs_error:
+            self.cmp_file, self.cmp_max_offset = old_file, old_cap
+            QMessageBox.warning(self, "Arquivo CMP", self.pairs_error)
+            return
+        if self.pairs_canceled:
+            self.cmp_file, self.cmp_max_offset = old_file, old_cap
             QMessageBox.information(self, "Arquivo CMP", "Geracao cancelada.")
             return
-        if not pairs:
-            self.cmp_table, self.cmp_max_offset = old_table, old_cap
+        if count == 0:
+            self.cmp_file, self.cmp_max_offset = old_file, old_cap
             QMessageBox.information(self, "Arquivo CMP",
                 "Nenhum par fonte-receptor encontrado ate o offset informado.")
             return
 
-        self.cmp_table = pairs
-        self.cmp_max_offset = max_offset
-
-        reply = QMessageBox.question(self, "Arquivo CMP",
-            "Arquivo CMP gerado em memoria: %d pares (offset ate %.1f m).\n\n"
+        QMessageBox.information(self, "Arquivo CMP",
+            "Arquivo CMP gerado e salvo em disco:\n%s\n\n"
+            "%d pares (offset ate %.1f m).\n\n"
             "Fold Map, Azimuth Map e Fold Rose calculados agora com offset\n"
-            "maximo ate %.1f m vao reaproveitar esses dados, sem recalcular.\n\n"
-            "Deseja tambem salvar esse arquivo em disco (para reaproveitar em outra sessao)?"
-            % (len(pairs), max_offset, max_offset),
-            QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            self.saveCMPTable()
+            "maximo ate esse valor vao reaproveitar o arquivo automaticamente."
+            % (path, count, max_offset))
 
     def saveCMPTable(self):
-        if self.cmp_table is None:
+        """ Save a copy of the current on-disk CMP cache elsewhere. """
+        if not self.cmp_file or not os.path.exists(self.cmp_file):
             QMessageBox.warning(self, "Arquivo CMP",
-                "Nenhum arquivo CMP em memoria. Gere um primeiro em "
-                "Computations > Arquivo CMP > Gerar arquivo CMP.")
+                "Nenhum arquivo CMP em cache no momento. Calcule um Fold/Azimuth Map, "
+                "ou use 'Gerar arquivo CMP' primeiro.")
             return
 
-        path, _ = QFileDialog.getSaveFileName(self, "Salvar arquivo CMP", self.data_dir, "CSV (*.csv)", options=QFileDialog.DontUseNativeDialog)
+        path, _ = QFileDialog.getSaveFileName(self, "Salvar copia do arquivo CMP",
+            self.data_dir, "Arquivo CMP (*.cmp)", options=QFileDialog.DontUseNativeDialog)
         if not path:
             return
-        if not path.lower().endswith('.csv'):
-            path += '.csv'
+        if not path.lower().endswith('.cmp'):
+            path += '.cmp'
 
-        ext = self.cmp_extent if self.cmp_extent else (0.0, 0.0, 0.0, 0.0)
         try:
-            with open(path, 'w') as f:
-                f.write("# extent_xmin,extent_xmax,extent_ymin,extent_ymax,max_offset\n")
-                f.write("# %.3f,%.3f,%.3f,%.3f,%.3f\n"
-                       % (ext[0], ext[1], ext[2], ext[3], self.cmp_max_offset))
-                f.write("mx,my,offset,azimuth\n")
-                for mx, my, offset, azimuth in self.cmp_table:
-                    f.write("%.3f,%.3f,%.3f,%.3f\n" % (mx, my, offset, azimuth))
+            shutil.copy(self.cmp_file, path)
         except Exception as e:
-            QMessageBox.warning(self, "Arquivo CMP", "Erro ao salvar: %s" % str(e))
+            QMessageBox.warning(self, "Arquivo CMP", "Erro ao copiar: %s" % str(e))
             return
 
-        QMessageBox.information(self, "Arquivo CMP", "Arquivo salvo:\n%s" % path)
+        QMessageBox.information(self, "Arquivo CMP", "Copia salva em:\n%s" % path)
 
     def loadCMPTable(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Carregar arquivo CMP", self.data_dir, "CSV (*.csv)", options=QFileDialog.DontUseNativeDialog)
+        path, _ = QFileDialog.getOpenFileName(self, "Carregar arquivo CMP", self.data_dir,
+            "Arquivo CMP (*.cmp)", options=QFileDialog.DontUseNativeDialog)
         if not path:
             return
 
-        pairs = []
-        extent = None
-        max_offset_cap = None
-        try:
-            with open(path, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith('#'):
-                        parts = line.lstrip('#').strip().split(',')
-                        if len(parts) == 5:
-                            try:
-                                vals = [float(x) for x in parts]
-                                extent = (vals[0], vals[1], vals[2], vals[3])
-                                max_offset_cap = vals[4]
-                            except ValueError:
-                                pass
-                        continue
-                    if line.lower().startswith('mx'):
-                        continue
-                    parts = line.split(',')
-                    if len(parts) != 4:
-                        continue
-                    mx, my, offset, azimuth = (float(v) for v in parts)
-                    pairs.append((mx, my, offset, azimuth))
-        except Exception as e:
-            QMessageBox.warning(self, "Arquivo CMP", "Erro ao ler o arquivo: %s" % str(e))
-            return
+        extent, max_offset_cap, count = self._readCMPHeader(path)
 
-        if not pairs:
+        if count == 0:
             QMessageBox.warning(self, "Arquivo CMP", "Arquivo vazio ou invalido.")
             return
 
-        self.cmp_table = pairs
-        self.cmp_max_offset = max_offset_cap if max_offset_cap is not None else max(p[2] for p in pairs)
+        self.cmp_file = path
         self.cmp_extent = extent
+        self.cmp_max_offset = max_offset_cap
+
+        if self.cmp_max_offset is None:
+            max_offset_cap, ok = QInputDialog.getDouble(self, "Arquivo CMP",
+                "O arquivo nao tem cabecalho de offset maximo.\n"
+                "Informe o offset maximo coberto por este arquivo (m):",
+                8000.0, 0.0, 1000000.0, 1)
+            if ok:
+                self.cmp_max_offset = max_offset_cap
 
         QMessageBox.information(self, "Arquivo CMP",
-            "Arquivo CMP carregado: %d pares, offset maximo = %.1f m"
-            % (len(pairs), self.cmp_max_offset))
+            "Arquivo CMP carregado (%s): %d pares, offset maximo = %s m"
+            % (path, count, str(self.cmp_max_offset)))
+
+    def designNodesGrid(self):
+        """ Generate a regular nodes grid (spacing dx along the line, dy
+        between lines, at a given azimuth) clipped to the 'pol2' (Node
+        Polygon) boundary, and save/load it as a nodes.txt file. """
+
+        pol_layer = next((x for x in lay if x.name() == 'pol2'), None)
+        if not pol_layer or not pol_layer.isValid():
+            QMessageBox.warning(self, "Design Nodes",
+                "Carregue o poligono de Nodes (pol2) antes de gerar o grid.")
+            return
+
+        feats = list(pol_layer.getFeatures())
+        if not feats or not feats[0].geometry() or feats[0].geometry().isEmpty():
+            QMessageBox.warning(self, "Design Nodes",
+                "O poligono de Nodes (pol2) esta vazio ou invalido.")
+            return
+        poly_geom = feats[0].geometry()
+
+        dx, ok1 = QInputDialog.getDouble(self, "Design Nodes",
+            "Espacamento entre nodes na linha - eixo X (m):", 400.0, 0.1, 100000.0, 1)
+        if not ok1:
+            return
+
+        dy, ok2 = QInputDialog.getDouble(self, "Design Nodes",
+            "Espacamento entre linhas de nodes - eixo Y (m):", 400.0, 0.1, 100000.0, 1)
+        if not ok2:
+            return
+
+        azimuth, ok3 = QInputDialog.getDouble(self, "Design Nodes",
+            "Direcao das linhas de nodes (azimute, graus, 0 = Norte):",
+            0.0, 0.0, 359.9, 1)
+        if not ok3:
+            return
+
+        start_line, ok4 = QInputDialog.getInt(self, "Design Nodes",
+            "Numero da primeira linha (L):", 1, 1, 999999, 1)
+        if not ok4:
+            return
+
+        start_station, ok5 = QInputDialog.getInt(self, "Design Nodes",
+            "Numero da primeira estacao (S):", 1, 1, 999999, 1)
+        if not ok5:
+            return
+
+        include_boundary = QMessageBox.question(self, "Design Nodes",
+            "Incluir nodes que caem exatamente em cima da linha do poligono?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes
+
+        stagger = QMessageBox.question(self, "Design Nodes",
+            "Alternar (escalonar) os nodes entre uma linha e outra?\n"
+            "Linhas pares deslocadas em metade do espacamento (dx/2).",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+
+        theta = math.radians(azimuth)
+        u = (math.sin(theta), math.cos(theta))     # along the node line (station direction, spaced by dx)
+        v = (math.cos(theta), -math.sin(theta))    # perpendicular (line direction, spaced by dy)
+
+        verts = list(poly_geom.vertices())
+        if not verts:
+            QMessageBox.warning(self, "Design Nodes",
+                "Nao foi possivel ler os vertices do poligono.")
+            return
+
+        bbox = poly_geom.boundingBox()
+        cx = (bbox.xMinimum() + bbox.xMaximum()) / 2.0
+        cy = (bbox.yMinimum() + bbox.yMaximum()) / 2.0
+
+        s_vals = []
+        l_vals = []
+        for pt in verts:
+            rx = pt.x() - cx
+            ry = pt.y() - cy
+            s_vals.append(rx * u[0] + ry * u[1])
+            l_vals.append(rx * v[0] + ry * v[1])
+
+        s_min, s_max = min(s_vals), max(s_vals)
+        l_min, l_max = min(l_vals), max(l_vals)
+
+        l0 = math.floor(l_min / dy) * dy
+        s0 = math.floor(s_min / dx) * dx
+        n_lines = int(math.floor((l_max - l0) / dy)) + 2
+        n_stations = int(math.floor((s_max - s0) / dx)) + 2
+
+        total_candidates = n_lines * n_stations
+        if total_candidates > 500000:
+            reply = QMessageBox.question(self, "Design Nodes",
+                "Essa configuracao vai testar aproximadamente %d pontos candidatos, "
+                "o que pode demorar bastante. Deseja continuar?" % total_candidates,
+                QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+
+        progress = QProgressDialog("Gerando grid de nodes...", "Cancelar", 0, n_lines, self)
+        progress.setWindowTitle("Design Nodes")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        rows = []
+        line_num = start_line
+        canceled = False
+        for li in range(n_lines):
+            progress.setValue(li)
+            if progress.wasCanceled():
+                canceled = True
+                break
+            l_coord = l0 + li * dy
+            if l_coord > l_max + dy:
+                break
+            s_offset = (dx / 2.0) if (stagger and li % 2 == 1) else 0.0
+            station_num = start_station
+            any_in_line = False
+            for si in range(n_stations):
+                s_coord = s0 + s_offset + si * dx
+                if s_coord > s_max + dx:
+                    break
+                x = cx + s_coord * u[0] + l_coord * v[0]
+                y = cy + s_coord * u[1] + l_coord * v[1]
+                pt_geom = QgsGeometry.fromPointXY(QgsPointXY(x, y))
+                is_inside = poly_geom.intersects(pt_geom) if include_boundary else poly_geom.contains(pt_geom)
+                if is_inside:
+                    rows.append((x, y, station_num, line_num))
+                    station_num += 1
+                    any_in_line = True
+            if any_in_line:
+                line_num += 1
+        progress.setValue(n_lines)
+
+        if canceled:
+            QMessageBox.information(self, "Design Nodes", "Geracao cancelada.")
+            return
+
+        if not rows:
+            QMessageBox.information(self, "Design Nodes",
+                "Nenhum node caiu dentro do poligono com esses parametros.")
+            return
+
+        default_path = os.path.join(self.data_dir, "nodes_design.txt")
+        path, _ = QFileDialog.getSaveFileName(self, "Salvar nodes.txt gerado",
+            default_path, "Text Files (*.txt)", options=QFileDialog.DontUseNativeDialog)
+        if not path:
+            return
+        if not path.lower().endswith('.txt'):
+            path += '.txt'
+
+        try:
+            with open(path, 'w') as f:
+                f.write("x y s l\n")
+                for x, y, s, l in rows:
+                    f.write("%.2f %.2f %d %d\n" % (x, y, s, l))
+        except Exception as e:
+            QMessageBox.warning(self, "Design Nodes", "Erro ao salvar: %s" % str(e))
+            return
+
+        filename = "file://" + path
+        uri = filename + "?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
+        new_layer = QgsVectorLayer(uri, "nodes", "delimitedtext")
+        if not new_layer.isValid():
+            QMessageBox.warning(self, "Design Nodes",
+                "Nodes gerados e salvos em:\n%s\n\nmas nao foi possivel carregar automaticamente."
+                % path)
+            return
+
+        self.replaceLayerInLay('nodes', new_layer)
+        self.actShowNodesLayer.setChecked(True)
+        self.showVisibleMapLayers()
+
+        QMessageBox.information(self, "Design Nodes",
+            "Grid de nodes gerado: %d nodes em %d linhas, dentro do poligono.\n\nSalvo em:\n%s"
+            % (len(rows), line_num - start_line, path))
 
     def computeFoldMap(self):
         """ Compute a fold map (CMP bin coverage) from the 'nodes' (receivers)
@@ -1440,29 +1859,32 @@ class MainWindow(QMainWindow):
                 "Offset minimo deve ser menor que o offset maximo.")
             return
 
-        pairs, canceled, err = self.getSourceReceiverPairs(
-            min_offset, max_offset, "Calculando fold map...")
-
-        if err:
-            QMessageBox.warning(self, "Fold Map", err)
-            return
-        if canceled:
-            QMessageBox.information(self, "Fold Map", "Calculo cancelado.")
-            return
-        if not pairs:
-            QMessageBox.information(self, "Fold Map",
-                "Nenhum par fonte-receptor encontrado na faixa de offset [%s, %s] m."
-                % (min_offset, max_offset))
-            return
-
-        xmin, xmax, ymin, ymax = self.cmp_extent
-
+        xmin = ymin = None
         fold_grid = {}   # (col, row) -> fold count
-        for mx, my, offset, azimuth in pairs:
+        for mx, my, offset, azimuth in self.getSourceReceiverPairs(
+                min_offset, max_offset, "Calculando fold map..."):
+            if xmin is None:
+                if self.cmp_extent is None:
+                    QMessageBox.warning(self, "Fold Map",
+                        "Extensao da area (nodes/shots) desconhecida -- nao foi possivel binar os resultados.")
+                    return
+                xmin, xmax, ymin, ymax = self.cmp_extent
             col = int((mx - xmin) / bin_size)
             row = int((my - ymin) / bin_size)
             key = (col, row)
             fold_grid[key] = fold_grid.get(key, 0) + 1
+
+        if self.pairs_error:
+            QMessageBox.warning(self, "Fold Map", self.pairs_error)
+            return
+        if self.pairs_canceled:
+            QMessageBox.information(self, "Fold Map", "Calculo cancelado.")
+            return
+        if not fold_grid:
+            QMessageBox.information(self, "Fold Map",
+                "Nenhum par fonte-receptor encontrado na faixa de offset [%s, %s] m."
+                % (min_offset, max_offset))
+            return
 
         fold_layer = QgsVectorLayer(
             "Polygon?crs=epsg:31983&field=fold:integer", "fold_map", "memory")
@@ -1490,9 +1912,11 @@ class MainWindow(QMainWindow):
         self.showVisibleMapLayers()
 
         fold_values = list(fold_grid.values())
+        cache_note = ("" if self.pairs_from_cache else
+                     "\n\nCache CMP salvo em: %s" % self.cmp_file)
         QMessageBox.information(self, "Fold Map",
-            "Fold calculado (offset %s - %s m): %d bins, fold minimo = %d, fold maximo = %d"
-            % (min_offset, max_offset, len(fold_grid), min(fold_values), max(fold_values)))
+            "Fold calculado (offset %s - %s m): %d bins, fold minimo = %d, fold maximo = %d%s"
+            % (min_offset, max_offset, len(fold_grid), min(fold_values), max(fold_values), cache_note))
 
     def computeAzimuthMap(self):
         """ Compute an azimuth map (mean source-receiver azimuth per CMP bin)
@@ -1518,26 +1942,17 @@ class MainWindow(QMainWindow):
                 "Offset minimo deve ser menor que o offset maximo.")
             return
 
-        pairs, canceled, err = self.getSourceReceiverPairs(
-            min_offset, max_offset, "Calculando mapa de azimute...")
-
-        if err:
-            QMessageBox.warning(self, "Azimuth Map", err)
-            return
-        if canceled:
-            QMessageBox.information(self, "Azimuth Map", "Calculo cancelado.")
-            return
-        if not pairs:
-            QMessageBox.information(self, "Azimuth Map",
-                "Nenhum par fonte-receptor encontrado na faixa de offset [%s, %s] m."
-                % (min_offset, max_offset))
-            return
-
-        xmin, xmax, ymin, ymax = self.cmp_extent
-
+        xmin = ymin = None
         # (col, row) -> [sum_sin, sum_cos, count]  (circular accumulation)
         azimuth_grid = {}
-        for mx, my, offset, azimuth in pairs:
+        for mx, my, offset, azimuth in self.getSourceReceiverPairs(
+                min_offset, max_offset, "Calculando mapa de azimute..."):
+            if xmin is None:
+                if self.cmp_extent is None:
+                    QMessageBox.warning(self, "Azimuth Map",
+                        "Extensao da area (nodes/shots) desconhecida -- nao foi possivel binar os resultados.")
+                    return
+                xmin, xmax, ymin, ymax = self.cmp_extent
             col = int((mx - xmin) / bin_size)
             row = int((my - ymin) / bin_size)
             key = (col, row)
@@ -1548,6 +1963,18 @@ class MainWindow(QMainWindow):
             acc[0] += math.sin(rad)
             acc[1] += math.cos(rad)
             acc[2] += 1
+
+        if self.pairs_error:
+            QMessageBox.warning(self, "Azimuth Map", self.pairs_error)
+            return
+        if self.pairs_canceled:
+            QMessageBox.information(self, "Azimuth Map", "Calculo cancelado.")
+            return
+        if not azimuth_grid:
+            QMessageBox.information(self, "Azimuth Map",
+                "Nenhum par fonte-receptor encontrado na faixa de offset [%s, %s] m."
+                % (min_offset, max_offset))
+            return
 
         azimuth_layer = QgsVectorLayer(
             "Polygon?crs=epsg:31983&field=azimuth:double", "azimuth_map", "memory")
@@ -1580,9 +2007,11 @@ class MainWindow(QMainWindow):
         self.actShowAzimuthLayer.setChecked(True)
         self.showVisibleMapLayers()
 
+        cache_note = ("" if self.pairs_from_cache else
+                     "\n\nCache CMP salvo em: %s" % self.cmp_file)
         QMessageBox.information(self, "Azimuth Map",
-            "Azimute calculado (offset %s - %s m): %d bins, azimute medio min = %d, max = %d graus"
-            % (min_offset, max_offset, len(azimuth_grid), round(min(mean_azimuths)), round(max(mean_azimuths))))
+            "Azimute calculado (offset %s - %s m): %d bins, azimute medio min = %d, max = %d graus%s"
+            % (min_offset, max_offset, len(azimuth_grid), round(min(mean_azimuths)), round(max(mean_azimuths)), cache_note))
 
     def computeFoldRose(self):
         """ Compute the fold (trace count) distribution binned by azimuth
@@ -1615,31 +2044,29 @@ class MainWindow(QMainWindow):
                 "Offset minimo deve ser menor que o offset maximo.")
             return
 
-        pairs, canceled, err = self.getSourceReceiverPairs(
-            min_offset, max_offset, "Calculando fold rose...")
-
-        if err:
-            QMessageBox.warning(self, "Fold Rose", err)
-            return
-        if canceled:
-            QMessageBox.information(self, "Fold Rose", "Calculo cancelado.")
-            return
-        if not pairs:
-            QMessageBox.information(self, "Fold Rose",
-                "Nenhum par fonte-receptor encontrado na faixa de offset [%s, %s] m."
-                % (min_offset, max_offset))
-            return
-
         sector_width = 360.0 / n_sectors
         ring_width = (max_offset - min_offset) / n_rings
 
         counts = [[0] * n_sectors for _ in range(n_rings)]   # counts[ring][sector]
-        for mx, my, offset, azimuth in pairs:
+        for mx, my, offset, azimuth in self.getSourceReceiverPairs(
+                min_offset, max_offset, "Calculando fold rose..."):
             sector = int(azimuth / sector_width) % n_sectors
             ring = int((offset - min_offset) / ring_width)
             if ring >= n_rings:
                 ring = n_rings - 1
             counts[ring][sector] += 1
+
+        if self.pairs_error:
+            QMessageBox.warning(self, "Fold Rose", self.pairs_error)
+            return
+        if self.pairs_canceled:
+            QMessageBox.information(self, "Fold Rose", "Calculo cancelado.")
+            return
+        if sum(sum(r) for r in counts) == 0:
+            QMessageBox.information(self, "Fold Rose",
+                "Nenhum par fonte-receptor encontrado na faixa de offset [%s, %s] m."
+                % (min_offset, max_offset))
+            return
 
         self.showFoldRoseDialog(counts, n_sectors, n_rings, min_offset, max_offset)
 
