@@ -2,3 +2,10 @@
 BACKUP/
 OLD/
 files.zip
+__pycache__/
+*.pyc
+cmp_cache.cmp
+cmp_cache.csv
+cmps.csv
+nodes_design.txt
+shots_design.txt

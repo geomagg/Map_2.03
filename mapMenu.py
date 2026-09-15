@@ -1692,11 +1692,21 @@ class MainWindow(QMainWindow):
             "Arquivo CMP carregado (%s): %d pares, offset maximo = %s m"
             % (path, count, str(self.cmp_max_offset)))
 
-    def _designGridInPolygon(self, poly_name, layer_name, title):
+    def _designGridInPolygon(self, poly_name, layer_name, title, is_shots=False):
         """ Generate a regular point grid (spacing dx along the line, dy
         between lines, at a given azimuth) clipped to the given polygon
         layer (poly_name), and save/load it as a <layer_name>.txt file.
-        Shared by Design > Gerar Nodes and Design > Gerar Shots. """
+        Shared by Design > Gerar Nodes and Design > Gerar Shots.
+
+        For shots, staggering between lines is driven by the number of
+        vessel sources (flip-flop = 2, flip-flap-flop = 3, etc): each
+        source fires in round-robin at a fixed "pop" interval, so line i
+        (0-indexed, ordered across the spread) is offset along-track by
+        (i mod n_sources) * pop, where pop = dx / n_sources and dx is the
+        shot interval on any single source's own line. With n_sources=1
+        this reduces to no staggering. For nodes, the same math is reused
+        with a simple yes/no "stagger by half spacing" question
+        (equivalent to n_sources=2). """
 
         pol_layer = next((x for x in lay if x.name() == poly_name), None)
         if not pol_layer or not pol_layer.isValid():
@@ -1711,13 +1721,15 @@ class MainWindow(QMainWindow):
             return
         poly_geom = feats[0].geometry()
 
-        dx, ok1 = QInputDialog.getDouble(self, title,
-            "Espacamento entre %s na linha - eixo X (m):" % layer_name, 400.0, 0.1, 100000.0, 1)
+        dx_label = ("Espacamento de tiro - intervalo entre tiros de uma mesma fonte, na linha (m):"
+                   if is_shots else "Espacamento entre nodes na linha - eixo X (m):")
+        dx, ok1 = QInputDialog.getDouble(self, title, dx_label, 50.0, 0.1, 100000.0, 1)
         if not ok1:
             return
 
-        dy, ok2 = QInputDialog.getDouble(self, title,
-            "Espacamento entre linhas de %s - eixo Y (m):" % layer_name, 400.0, 0.1, 100000.0, 1)
+        dy_label = ("Espacamento entre linhas de tiro (m):"
+                   if is_shots else "Espacamento entre linhas de nodes - eixo Y (m):")
+        dy, ok2 = QInputDialog.getDouble(self, title, dy_label, 50.0, 0.1, 100000.0, 1)
         if not ok2:
             return
 
@@ -1741,10 +1753,23 @@ class MainWindow(QMainWindow):
             "Incluir %s que caem exatamente em cima da linha do poligono?" % layer_name,
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes
 
-        stagger = QMessageBox.question(self, title,
-            "Alternar (escalonar) os %s entre uma linha e outra?\n"
-            "Linhas pares deslocadas em metade do espacamento (dx/2)." % layer_name,
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+        n_sources = 1
+        if is_shots:
+            n_sources, okN = QInputDialog.getInt(self, title,
+                "Numero de fontes do navio:\n"
+                "1 = sem flip-flop -- 2 = flip-flop -- 3 = flip-flap-flop -- ate 6",
+                2, 1, 6, 1)
+            if not okN:
+                return
+            stagger_positions = n_sources
+        else:
+            stagger_yn = QMessageBox.question(self, title,
+                "Alternar (escalonar) os %s entre uma linha e outra?\n"
+                "Linhas pares deslocadas em metade do espacamento (dx/2)." % layer_name,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+            stagger_positions = 2 if stagger_yn else 1
+
+        pop = dx / stagger_positions   # vessel shot interval, for shots with n_sources > 1
 
         theta = math.radians(azimuth)
         u = (math.sin(theta), math.cos(theta))     # along the line (station direction, spaced by dx)
@@ -1800,7 +1825,7 @@ class MainWindow(QMainWindow):
             l_coord = l0 + li * dy
             if l_coord > l_max + dy:
                 break
-            s_offset = (dx / 2.0) if (stagger and li % 2 == 1) else 0.0
+            s_offset = (li % stagger_positions) * pop if stagger_positions > 1 else 0.0
             station_num = start_station
             any_in_line = False
             for si in range(n_stations):
@@ -1859,15 +1884,21 @@ class MainWindow(QMainWindow):
         view_checkbox.setChecked(True)
         self.showVisibleMapLayers()
 
+        extra_note = ""
+        if is_shots and n_sources > 1:
+            extra_note = ("\n\n%d fontes (flip-flop/flap): pop (intervalo real de disparo) = %.2f m, "
+                         "intervalo de tiro por fonte = %.2f m, linhas espacadas de %.2f m."
+                         % (n_sources, pop, dx, dy))
+
         QMessageBox.information(self, title,
-            "Grid de %s gerado: %d pontos em %d linhas, dentro do poligono.\n\nSalvo em:\n%s"
-            % (layer_name, len(rows), line_num - start_line, path))
+            "Grid de %s gerado: %d pontos em %d linhas, dentro do poligono.\n\nSalvo em:\n%s%s"
+            % (layer_name, len(rows), line_num - start_line, path, extra_note))
 
     def designNodesGrid(self):
-        self._designGridInPolygon('pol2', 'nodes', 'Design Nodes')
+        self._designGridInPolygon('pol2', 'nodes', 'Design Nodes', is_shots=False)
 
     def designShotsGrid(self):
-        self._designGridInPolygon('polshot', 'shots', 'Design Shots')
+        self._designGridInPolygon('polshot', 'shots', 'Design Shots', is_shots=True)
 
     def computeFoldMap(self):
         """ Compute a fold map (CMP bin coverage) from the 'nodes' (receivers)
