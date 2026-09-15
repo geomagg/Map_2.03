@@ -5,7 +5,7 @@ from qgis.gui import QgsMapToolIdentify
 
 from PyQt5.QtCore import pyqtSignal, Qt
 from PyQt5.QtGui import QColor
-from qgis.core import QgsGeometry, QgsPointXY
+from qgis.core import QgsGeometry, QgsPointXY, QgsRectangle, QgsWkbTypes
 from qgis.gui import QgsMapToolEmitPoint, QgsRubberBand
 
 
@@ -79,3 +79,52 @@ class infoTool(QgsMapToolIdentify):
             QMessageBox.information(self.windows,
                                     "Line & Station",
                                     "\n".join(info))
+
+
+class RectSelectTool(QgsMapToolEmitPoint):
+    """ Map tool to select a rectangular area by click-and-drag. Emits
+    area_selected(QgsRectangle) with the map-coordinates extent when the
+    mouse button is released. """
+
+    area_selected = pyqtSignal(QgsRectangle)
+
+    def __init__(self, canvas):
+        self.canvas = canvas
+        QgsMapToolEmitPoint.__init__(self, canvas)
+        self.start_point = None
+        self.rubberband = None
+
+    def canvasPressEvent(self, e):
+        self.start_point = self.toMapCoordinates(e.pos())
+        if self.rubberband:
+            self.rubberband.reset(QgsWkbTypes.PolygonGeometry)
+        else:
+            self.rubberband = QgsRubberBand(self.canvas, QgsWkbTypes.PolygonGeometry)
+            self.rubberband.setColor(QColor(255, 0, 0, 60))
+            self.rubberband.setWidth(1)
+
+    def canvasMoveEvent(self, e):
+        if self.start_point is None or self.rubberband is None:
+            return
+        current = self.toMapCoordinates(e.pos())
+        self._updateRubberband(self.start_point, current)
+
+    def canvasReleaseEvent(self, e):
+        if self.start_point is None:
+            return
+        end_point = self.toMapCoordinates(e.pos())
+        rect = QgsRectangle(self.start_point, end_point)
+        if self.rubberband:
+            self.rubberband.reset(QgsWkbTypes.PolygonGeometry)
+        self.start_point = None
+        self.area_selected.emit(rect)
+
+    def _updateRubberband(self, p1, p2):
+        points = [
+            QgsPointXY(p1.x(), p1.y()),
+            QgsPointXY(p2.x(), p1.y()),
+            QgsPointXY(p2.x(), p2.y()),
+            QgsPointXY(p1.x(), p2.y()),
+            QgsPointXY(p1.x(), p1.y()),
+        ]
+        self.rubberband.setToGeometry(QgsGeometry.fromPolygonXY([points]), None)

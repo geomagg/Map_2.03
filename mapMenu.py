@@ -17,6 +17,7 @@ from qgis.core import (QgsProject, QgsVectorLayer, QgsPoint, QgsPointXY, QgsRast
                        QgsWkbTypes)
 from map_tool import ConnectTool
 from map_tool import infoTool
+from map_tool import RectSelectTool
 import math
 import icons
 
@@ -28,6 +29,10 @@ class MainWindow(QMainWindow):
         self.project = QgsProject()
         global curr_dir
         curr_dir = os.path.dirname(os.path.realpath(__file__))
+
+        # default folder shown by the "Open file" dialogs (Layers menu).
+        # Change it via Preferences > Diretorio de dados.
+        self.data_dir = curr_dir
 
         # default layer styling (color/size), can be changed via Layer Preferences menu
         self.nodesColor = QColor(255, 0, 0)
@@ -44,6 +49,9 @@ class MainWindow(QMainWindow):
         self.foldRanges = []
         self.azimuthOpacity = 0.6
         self.azimuthRanges = []
+        self.cmp_table = None       # cached list of (mx, my, offset, azimuth)
+        self.cmp_max_offset = None  # max offset covered by self.cmp_table
+        self.cmp_extent = None      # (xmin, xmax, ymin, ymax) of nodes+shots, for stable binning
 
         self.initUI()
 
@@ -61,23 +69,9 @@ class MainWindow(QMainWindow):
 #        if layer.isValid():
         lay.append(layer)
 
-        shotspath = "/shots.txt"
-        filename = "file://"+curr_d+shotspath   
-        uri=filename+"?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
-        layer = QgsVectorLayer(uri, "shots", "delimitedtext")
-        lay.append(layer)
-
-        sailpath = "/sail.txt"
-        filename = "file://"+curr_d+sailpath   
-        uri=filename+"?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
-        layer = QgsVectorLayer(uri, "sail", "delimitedtext")
-        lay.append(layer)
-
-        gridpath = "/grid.txt"
-        filename = "file://"+curr_d+gridpath
-        uri=filename+"?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
-        layer = QgsVectorLayer(uri, "grid", "delimitedtext")
-        lay.append(layer)
+        # shots.txt, sail.txt e grid.txt NAO sao carregados automaticamente no
+        # startup por escolha do usuario -- use os menus Layers > Shape_files
+        # ou Layers > txtfiles para carrega-los manualmente quando precisar.
 
         pol2path = "/pol2.txt"
         filename = "file://"+curr_d+pol2path   
@@ -105,6 +99,13 @@ class MainWindow(QMainWindow):
         else:
             lay.append(raw_layer)
 
+        # show nodes + the two polygons automatically at startup; the user
+        # loads shots/sail/grid manually afterwards via the Layers menu
+        self.actShowNodesLayer.setChecked(True)
+        self.actShowPolNodeLayer.setChecked(True)
+        self.actShowPolShotLayer.setChecked(True)
+        self.showVisibleMapLayers()
+
 ###-----------------------------------------------------------------------------------------
 
     def initUI(self):
@@ -121,6 +122,11 @@ class MainWindow(QMainWindow):
         self.map_canvas = QgsMapCanvas()
         self.grid_layout.addWidget(self.map_canvas)
         self.map_canvas.setCanvasColor(QColor(200, 200,200))
+        # performance: cache each layer's rendered image and reuse it across
+        # zoom/pan when the data hasn't changed, and render layers in parallel
+        # -- helps a lot with layers that have many points (like shots)
+        self.map_canvas.setCachingEnabled(True)
+        self.map_canvas.setParallelRenderingEnabled(True)
 #
 #
         # Fold map legend dock (hidden by default)
@@ -453,6 +459,11 @@ class MainWindow(QMainWindow):
         preferencesMenu.addAction(colorAct)
         colorAct.triggered.connect(self.colorDialog)
 
+        dataDirAct = QAction('Diretorio de dados', self)
+        dataDirAct.setStatusTip('Pasta padrao aberta pelos dialogos de "Open file" (Layers)')
+        preferencesMenu.addAction(dataDirAct)
+        dataDirAct.triggered.connect(self.setDataDir)
+
         # Computations
         computationsMenu = menubar.addMenu('&Computations')
         compAct = QAction(QIcon('backgroundcolor.png'), 'Total Number of Nodes', self)
@@ -471,6 +482,25 @@ class MainWindow(QMainWindow):
         foldRoseAct.setStatusTip('Compute fold distribution by azimuth sector (polar diagram)')
         computationsMenu.addAction(foldRoseAct)
         foldRoseAct.triggered.connect(self.computeFoldRose)
+
+        cmpMenu = QMenu('Arquivo CMP', self)
+
+        buildCmpAct = QAction('Gerar arquivo CMP', self)
+        buildCmpAct.setStatusTip('Compute and cache all node-shot pairs (midpoint, offset, azimuth) up to a max offset')
+        cmpMenu.addAction(buildCmpAct)
+        buildCmpAct.triggered.connect(self.buildCMPTable)
+
+        saveCmpAct = QAction('Salvar arquivo CMP', self)
+        saveCmpAct.setStatusTip('Save the cached CMP table to a CSV file')
+        cmpMenu.addAction(saveCmpAct)
+        saveCmpAct.triggered.connect(self.saveCMPTable)
+
+        loadCmpAct = QAction('Carregar arquivo CMP', self)
+        loadCmpAct.setStatusTip('Load a previously saved CMP table from a CSV file')
+        cmpMenu.addAction(loadCmpAct)
+        loadCmpAct.triggered.connect(self.loadCMPTable)
+
+        computationsMenu.addMenu(cmpMenu)
 
         # Help
         helpMenu = menubar.addMenu('&Help')
@@ -536,6 +566,15 @@ class MainWindow(QMainWindow):
         self.connect_action.triggered.connect(self.connect_pt)
         self.tool_connect = ConnectTool(self.map_canvas)
         self.tool_connect.line_complete.connect(self.connect_complete)
+
+        # Select area (count nodes/shots)
+        self.area_select_action = QAction(QIcon(":/icons/polygon.png"), "Select Area", self)
+        self.area_select_action.setCheckable(True)
+        self.area_select_action.setStatusTip('Arraste um retangulo no mapa para contar nodes/shots na area')
+        self.toolbar.addAction(self.area_select_action)
+        self.area_select_action.triggered.connect(self.selectArea)
+        self.tool_area_select = RectSelectTool(self.map_canvas)
+        self.tool_area_select.area_selected.connect(self.countInArea)
 
         # Exit 
         exitAct1 = QAction(QIcon(":/icons/quit.png"), 'Exit', self)
@@ -658,7 +697,7 @@ class MainWindow(QMainWindow):
           layer.setRenderer(renderer)
           lay1.append(layer)
      else:
-       if self.actShowGridlLayer.isChecked():
+       if self.actShowGridLayer.isChecked():
          QMessageBox.about(self, "LAYER LOADED!", "Grid shapefile NOT loaded")
          self.actShowGridLayer.setChecked(False)
 
@@ -764,7 +803,7 @@ class MainWindow(QMainWindow):
      self.map_canvas.zoomToFullExtent()
 ###
     def ogrNodesInput(self):
-        path = QFileDialog.getOpenFileName(self, 'Open file', curr_dir)
+        path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
         if path[0]:
            (name, ext) = os.path.basename(path[0]).split('.')
            layer = QgsVectorLayer(path[0], 'nodes', 'ogr')
@@ -775,7 +814,7 @@ class MainWindow(QMainWindow):
              QMessageBox.about(self, "LAYER NOT LOADED", "Nodes shapefile NOT loaded")
  
     def ogrShotsInput(self):
-        path = QFileDialog.getOpenFileName(self, 'Open file', curr_dir)
+        path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
         if path[0]:
            layer = QgsVectorLayer(path[0], 'shots', 'ogr')
            if layer.isValid():
@@ -785,7 +824,7 @@ class MainWindow(QMainWindow):
              QMessageBox.about(self, "LAYER NOT LOADED", "Shot shapefile NOT loaded")
 
     def ogrSailInput(self):
-        path = QFileDialog.getOpenFileName(self, 'Open file', curr_dir)
+        path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
         if path[0]:
            layer = QgsVectorLayer(path[0], 'sail', 'ogr')
            if layer.isValid():
@@ -795,7 +834,7 @@ class MainWindow(QMainWindow):
              QMessageBox.about(self, "LAYER NOT LOADED", "Sail shapefile NOT loaded")
 
     def ogrGridInput(self):
-        path = QFileDialog.getOpenFileName(self, 'Open file', curr_dir)
+        path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
         if path[0]:
            layer = QgsVectorLayer(path[0], 'grid', 'ogr')
            if layer.isValid():
@@ -809,7 +848,7 @@ class MainWindow(QMainWindow):
 
 
     def ogrPol2Input(self):
-        path = QFileDialog.getOpenFileName(self, 'Open file', curr_dir)
+        path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
         if path[0]:
            raw_layer = QgsVectorLayer(path[0], 'pol2', 'ogr')
            if raw_layer.isValid():
@@ -830,7 +869,7 @@ class MainWindow(QMainWindow):
              QMessageBox.about(self, "LAYER NOT LOADED", "Pol2 shapefile NOT loaded")
 
     def ogrPol3Input(self):
-        path = QFileDialog.getOpenFileName(self, 'Open file', curr_dir)
+        path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
         if path[0]:
            raw_layer = QgsVectorLayer(path[0], 'polshot', 'ogr')
            if raw_layer.isValid():
@@ -851,7 +890,7 @@ class MainWindow(QMainWindow):
              QMessageBox.about(self, "LAYER NOT LOADED", "Polshot shapefile NOT loaded")
 
     def txtNodesInput(self):
-       path = QFileDialog.getOpenFileName(self, 'Open file', curr_dir)
+       path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
        if path[0]:
          print ('CXXXXXXXXXXXXXX CARALHO WWWWWW', curr_dir)
          filename = "file://"+path[0]   # os.path.join(cur_dir, ProJect, "nodes.txt")
@@ -866,7 +905,7 @@ class MainWindow(QMainWindow):
              QMessageBox.about(self, "LAYER NOT LOADED", "Nodes txt-delimited NOT loaded")
 
     def txtShotsInput(self):
-       path = QFileDialog.getOpenFileName(self, 'Open file', curr_dir)
+       path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
        if path[0]:
            filename = "file://"+path[0]   
            uri=filename+"?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
@@ -878,7 +917,7 @@ class MainWindow(QMainWindow):
              QMessageBox.about(self, "LAYER NOT LOADED", "Shots txt-delimited NOT loaded")
 
     def txtSailInput(self):
-       path = QFileDialog.getOpenFileName(self, 'Open file', curr_dir)
+       path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
        if path[0]:
            filename = "file://"+path[0]   
            uri=filename+"?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
@@ -890,7 +929,7 @@ class MainWindow(QMainWindow):
              QMessageBox.about(self, "LAYER NOT LOADED", "Sail txt-delimited NOT loaded")
 
     def txtGridInput(self):
-       path = QFileDialog.getOpenFileName(self, 'Open file', curr_dir)
+       path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
        if path[0]:
            filename = "file://"+path[0]   
            uri=filename+"?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
@@ -905,7 +944,7 @@ class MainWindow(QMainWindow):
 
 
     def txtPol2Input(self):
-       path = QFileDialog.getOpenFileName(self, 'Open file', curr_dir)
+       path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
        if path[0]:
            filename = "file://"+path[0]   
            uri=filename+"?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
@@ -928,7 +967,7 @@ class MainWindow(QMainWindow):
              QMessageBox.about(self, "LAYER NOT LOADED", "Pol2 txt-delimited NOT loaded")
 
     def txtPol3Input(self):
-       path = QFileDialog.getOpenFileName(self, 'Open file', curr_dir)
+       path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
        if path[0]:
            filename = "file://"+path[0]   
            uri=filename+"?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
@@ -951,7 +990,7 @@ class MainWindow(QMainWindow):
              QMessageBox.about(self, "LAYER NOT LOADED", "Polshot txt-delimited NOT loaded")
 
     def rasterBathymetry(self):
-       path = QFileDialog.getOpenFileName(self, 'Open file', curr_dir)
+       path = QFileDialog.getOpenFileName(self, 'Open file', self.data_dir, options=QFileDialog.DontUseNativeDialog)
        if path[0]:
            layer = QgsRasterLayer(path[0], "bathymetry")
            if layer.isValid():
@@ -1028,6 +1067,13 @@ class MainWindow(QMainWindow):
 #                % col.name())
 
           self.map_canvas.setCanvasColor(QColor(col))
+
+    def setDataDir(self):
+        new_dir = QFileDialog.getExistingDirectory(self,
+            "Escolha a pasta com seus arquivos (nodes, shots, sail, etc.)",
+            self.data_dir, options=QFileDialog.DontUseNativeDialog)
+        if new_dir:
+            self.data_dir = new_dir
 
     def colorLayerDialog(self):
 
@@ -1111,6 +1157,36 @@ class MainWindow(QMainWindow):
         self.map_canvas.setMapTool(self.tool_connect)
         self.connect_action.setChecked(True)
 
+    def selectArea(self):
+        self.map_canvas.setMapTool(self.tool_area_select)
+        self.area_select_action.setChecked(True)
+
+    def countInArea(self, rect):
+        nodes_layer = next((x for x in lay if x.name() == 'nodes'), None)
+        shots_layer = next((x for x in lay if x.name() == 'shots'), None)
+
+        node_count = 0
+        shot_count = 0
+
+        if nodes_layer and nodes_layer.isValid():
+            for f in nodes_layer.getFeatures():
+                geom = f.geometry()
+                if geom and not geom.isEmpty() and rect.contains(geom.asPoint()):
+                    node_count += 1
+
+        if shots_layer and shots_layer.isValid():
+            for f in shots_layer.getFeatures():
+                geom = f.geometry()
+                if geom and not geom.isEmpty() and rect.contains(geom.asPoint()):
+                    shot_count += 1
+
+        QMessageBox.information(self, "Contagem na Area",
+            "Area selecionada:\nX: [%.1f, %.1f]   Y: [%.1f, %.1f]\n\nNodes: %d\nShots: %d"
+            % (rect.xMinimum(), rect.xMaximum(), rect.yMinimum(), rect.yMaximum(),
+               node_count, shot_count))
+
+        self.area_select_action.setChecked(False)
+
     def connect_complete(self, pt1, pt2):
 
         distance_calc = QgsDistanceArea()
@@ -1143,22 +1219,206 @@ class MainWindow(QMainWindow):
        """ SLOT. Show scale """
        self.lblScale.setText( "Scale 1:" + str(round(scale)) )
 
-    def computeFoldMap(self):
-        """ Compute a fold map (CMP bin coverage) from the 'nodes' (receivers)
-        and 'shots' (sources) layers, and display it as a colored grid. """
+    def getSourceReceiverPairs(self, min_offset, max_offset, progress_title="Calculando..."):
+        """ Return (pairs, canceled, error) where pairs is a list of
+        (mx, my, offset, azimuth) tuples for every node-shot pair with
+        min_offset <= offset <= max_offset. Reuses the cached CMP table
+        (self.cmp_table / self.cmp_extent) when it already covers
+        max_offset, avoiding a full recomputation; otherwise computes
+        directly from the 'nodes'/'shots' layers (with a progress dialog).
+        This fresh computation is NOT cached into self.cmp_table -- use
+        Computations > Arquivo CMP > Gerar arquivo CMP for that. """
+
+        if (self.cmp_table is not None and self.cmp_max_offset is not None
+                and max_offset <= self.cmp_max_offset):
+            pairs = [p for p in self.cmp_table if min_offset <= p[2] <= max_offset]
+            return pairs, False, None
 
         nodes_layer = next((x for x in lay if x.name() == 'nodes'), None)
         shots_layer = next((x for x in lay if x.name() == 'shots'), None)
 
         if not nodes_layer or not shots_layer:
-            QMessageBox.warning(self, "Fold Map",
-                "Carregue as camadas de Nodes e Shots antes de calcular o fold.")
+            return None, False, "Carregue as camadas de Nodes e Shots antes de calcular."
+        if not nodes_layer.isValid() or not shots_layer.isValid():
+            return None, False, "As camadas de Nodes e/ou Shots nao sao validas."
+
+        node_pts = [f.geometry().asPoint() for f in nodes_layer.getFeatures()
+                   if f.geometry() and not f.geometry().isEmpty()]
+        shot_pts = [f.geometry().asPoint() for f in shots_layer.getFeatures()
+                   if f.geometry() and not f.geometry().isEmpty()]
+
+        if not node_pts or not shot_pts:
+            return None, False, "As camadas de Nodes/Shots estao vazias."
+
+        index = QgsSpatialIndex()
+        node_feats = []
+        for i, p in enumerate(node_pts):
+            feat = QgsFeature(i)
+            feat.setGeometry(QgsGeometry.fromPointXY(p))
+            node_feats.append(feat)
+            index.insertFeature(feat)
+
+        all_x = [p.x() for p in node_pts] + [p.x() for p in shot_pts]
+        all_y = [p.y() for p in node_pts] + [p.y() for p in shot_pts]
+        self.cmp_extent = (min(all_x), max(all_x), min(all_y), max(all_y))
+
+        pairs = []
+        progress = QProgressDialog(progress_title, "Cancelar", 0, len(shot_pts), self)
+        progress.setWindowTitle("Calculando")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        canceled = False
+        for i, sp in enumerate(shot_pts):
+            if i % 20 == 0:
+                progress.setValue(i)
+                if progress.wasCanceled():
+                    canceled = True
+                    break
+            rect = QgsRectangle(sp.x() - max_offset, sp.y() - max_offset,
+                                sp.x() + max_offset, sp.y() + max_offset)
+            for nid in index.intersects(rect):
+                np_ = node_pts[nid]
+                dx = np_.x() - sp.x()
+                dy = np_.y() - sp.y()
+                offset = math.hypot(dx, dy)
+                if offset > max_offset or offset < min_offset:
+                    continue
+                mx = (sp.x() + np_.x()) / 2.0
+                my = (sp.y() + np_.y()) / 2.0
+                azimuth = math.degrees(math.atan2(dx, dy))
+                if azimuth < 0:
+                    azimuth += 360.0
+                pairs.append((mx, my, offset, azimuth))
+
+        progress.setValue(len(shot_pts))
+        return pairs, canceled, None
+
+    def buildCMPTable(self):
+        """ Compute and cache ALL node-shot pairs (mx, my, offset, azimuth)
+        up to a chosen max offset. Any Fold/Azimuth/Rose calculation done
+        afterwards with max offset <= this cap reuses the cache instead of
+        recomputing the full spatial search. """
+
+        max_offset, ok = QInputDialog.getDouble(self, "Arquivo CMP",
+            "Offset maximo a incluir no arquivo CMP (m):\n"
+            "Calculos feitos depois podem usar qualquer offset ate este valor\n"
+            "sem precisar recalcular tudo de novo.",
+            8000.0, 0.0, 1000000.0, 1)
+        if not ok:
             return
 
-        if not nodes_layer.isValid() or not shots_layer.isValid():
-            QMessageBox.warning(self, "Fold Map",
-                "As camadas de Nodes e/ou Shots nao sao validas.")
+        old_table, old_cap = self.cmp_table, self.cmp_max_offset
+        self.cmp_table, self.cmp_max_offset = None, None
+
+        pairs, canceled, err = self.getSourceReceiverPairs(
+            0.0, max_offset, "Gerando arquivo CMP...")
+
+        if err:
+            self.cmp_table, self.cmp_max_offset = old_table, old_cap
+            QMessageBox.warning(self, "Arquivo CMP", err)
             return
+        if canceled:
+            self.cmp_table, self.cmp_max_offset = old_table, old_cap
+            QMessageBox.information(self, "Arquivo CMP", "Geracao cancelada.")
+            return
+        if not pairs:
+            self.cmp_table, self.cmp_max_offset = old_table, old_cap
+            QMessageBox.information(self, "Arquivo CMP",
+                "Nenhum par fonte-receptor encontrado ate o offset informado.")
+            return
+
+        self.cmp_table = pairs
+        self.cmp_max_offset = max_offset
+
+        reply = QMessageBox.question(self, "Arquivo CMP",
+            "Arquivo CMP gerado em memoria: %d pares (offset ate %.1f m).\n\n"
+            "Fold Map, Azimuth Map e Fold Rose calculados agora com offset\n"
+            "maximo ate %.1f m vao reaproveitar esses dados, sem recalcular.\n\n"
+            "Deseja tambem salvar esse arquivo em disco (para reaproveitar em outra sessao)?"
+            % (len(pairs), max_offset, max_offset),
+            QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.saveCMPTable()
+
+    def saveCMPTable(self):
+        if self.cmp_table is None:
+            QMessageBox.warning(self, "Arquivo CMP",
+                "Nenhum arquivo CMP em memoria. Gere um primeiro em "
+                "Computations > Arquivo CMP > Gerar arquivo CMP.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(self, "Salvar arquivo CMP", self.data_dir, "CSV (*.csv)", options=QFileDialog.DontUseNativeDialog)
+        if not path:
+            return
+        if not path.lower().endswith('.csv'):
+            path += '.csv'
+
+        ext = self.cmp_extent if self.cmp_extent else (0.0, 0.0, 0.0, 0.0)
+        try:
+            with open(path, 'w') as f:
+                f.write("# extent_xmin,extent_xmax,extent_ymin,extent_ymax,max_offset\n")
+                f.write("# %.3f,%.3f,%.3f,%.3f,%.3f\n"
+                       % (ext[0], ext[1], ext[2], ext[3], self.cmp_max_offset))
+                f.write("mx,my,offset,azimuth\n")
+                for mx, my, offset, azimuth in self.cmp_table:
+                    f.write("%.3f,%.3f,%.3f,%.3f\n" % (mx, my, offset, azimuth))
+        except Exception as e:
+            QMessageBox.warning(self, "Arquivo CMP", "Erro ao salvar: %s" % str(e))
+            return
+
+        QMessageBox.information(self, "Arquivo CMP", "Arquivo salvo:\n%s" % path)
+
+    def loadCMPTable(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Carregar arquivo CMP", self.data_dir, "CSV (*.csv)", options=QFileDialog.DontUseNativeDialog)
+        if not path:
+            return
+
+        pairs = []
+        extent = None
+        max_offset_cap = None
+        try:
+            with open(path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith('#'):
+                        parts = line.lstrip('#').strip().split(',')
+                        if len(parts) == 5:
+                            try:
+                                vals = [float(x) for x in parts]
+                                extent = (vals[0], vals[1], vals[2], vals[3])
+                                max_offset_cap = vals[4]
+                            except ValueError:
+                                pass
+                        continue
+                    if line.lower().startswith('mx'):
+                        continue
+                    parts = line.split(',')
+                    if len(parts) != 4:
+                        continue
+                    mx, my, offset, azimuth = (float(v) for v in parts)
+                    pairs.append((mx, my, offset, azimuth))
+        except Exception as e:
+            QMessageBox.warning(self, "Arquivo CMP", "Erro ao ler o arquivo: %s" % str(e))
+            return
+
+        if not pairs:
+            QMessageBox.warning(self, "Arquivo CMP", "Arquivo vazio ou invalido.")
+            return
+
+        self.cmp_table = pairs
+        self.cmp_max_offset = max_offset_cap if max_offset_cap is not None else max(p[2] for p in pairs)
+        self.cmp_extent = extent
+
+        QMessageBox.information(self, "Arquivo CMP",
+            "Arquivo CMP carregado: %d pares, offset maximo = %.1f m"
+            % (len(pairs), self.cmp_max_offset))
+
+    def computeFoldMap(self):
+        """ Compute a fold map (CMP bin coverage) from the 'nodes' (receivers)
+        and 'shots' (sources) layers, and display it as a colored grid. """
 
         bin_size, ok1 = QInputDialog.getDouble(self, "Fold Map",
             "Tamanho do bin (m):", 100.0, 1.0, 100000.0, 1)
@@ -1180,69 +1440,29 @@ class MainWindow(QMainWindow):
                 "Offset minimo deve ser menor que o offset maximo.")
             return
 
-        node_pts = [f.geometry().asPoint() for f in nodes_layer.getFeatures()
-                   if f.geometry() and not f.geometry().isEmpty()]
-        shot_pts = [f.geometry().asPoint() for f in shots_layer.getFeatures()
-                   if f.geometry() and not f.geometry().isEmpty()]
+        pairs, canceled, err = self.getSourceReceiverPairs(
+            min_offset, max_offset, "Calculando fold map...")
 
-        if not node_pts or not shot_pts:
-            QMessageBox.warning(self, "Fold Map",
-                "As camadas de Nodes/Shots estao vazias.")
+        if err:
+            QMessageBox.warning(self, "Fold Map", err)
             return
-
-        # spatial index on the nodes, so for each shot we only test nearby nodes
-        index = QgsSpatialIndex()
-        node_feats = []
-        for i, p in enumerate(node_pts):
-            feat = QgsFeature(i)
-            feat.setGeometry(QgsGeometry.fromPointXY(p))
-            node_feats.append(feat)
-            index.insertFeature(feat)
-
-        all_x = [p.x() for p in node_pts] + [p.x() for p in shot_pts]
-        all_y = [p.y() for p in node_pts] + [p.y() for p in shot_pts]
-        xmin, xmax = min(all_x), max(all_x)
-        ymin, ymax = min(all_y), max(all_y)
-
-        fold_grid = {}   # (col, row) -> fold count
-
-        progress = QProgressDialog("Calculando fold map...", "Cancelar", 0, len(shot_pts), self)
-        progress.setWindowTitle("Fold Map")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-
-        canceled = False
-        for i, sp in enumerate(shot_pts):
-            if i % 20 == 0:
-                progress.setValue(i)
-                if progress.wasCanceled():
-                    canceled = True
-                    break
-            rect = QgsRectangle(sp.x() - max_offset, sp.y() - max_offset,
-                                sp.x() + max_offset, sp.y() + max_offset)
-            for nid in index.intersects(rect):
-                np_ = node_pts[nid]
-                offset = math.hypot(np_.x() - sp.x(), np_.y() - sp.y())
-                if offset > max_offset or offset < min_offset:
-                    continue
-                mx = (sp.x() + np_.x()) / 2.0
-                my = (sp.y() + np_.y()) / 2.0
-                col = int((mx - xmin) / bin_size)
-                row = int((my - ymin) / bin_size)
-                key = (col, row)
-                fold_grid[key] = fold_grid.get(key, 0) + 1
-
-        progress.setValue(len(shot_pts))
-
         if canceled:
             QMessageBox.information(self, "Fold Map", "Calculo cancelado.")
             return
-
-        if not fold_grid:
+        if not pairs:
             QMessageBox.information(self, "Fold Map",
                 "Nenhum par fonte-receptor encontrado na faixa de offset [%s, %s] m."
                 % (min_offset, max_offset))
             return
+
+        xmin, xmax, ymin, ymax = self.cmp_extent
+
+        fold_grid = {}   # (col, row) -> fold count
+        for mx, my, offset, azimuth in pairs:
+            col = int((mx - xmin) / bin_size)
+            row = int((my - ymin) / bin_size)
+            key = (col, row)
+            fold_grid[key] = fold_grid.get(key, 0) + 1
 
         fold_layer = QgsVectorLayer(
             "Polygon?crs=epsg:31983&field=fold:integer", "fold_map", "memory")
@@ -1265,13 +1485,7 @@ class MainWindow(QMainWindow):
 
         self.applyFoldRenderer(fold_layer)
 
-        # replace any previous fold map so recomputing doesn't pile up layers
-        existing_fold = next((x for x in lay if x.name() == 'fold_map'), None)
-        if existing_fold:
-            lay.remove(existing_fold)
-            self.project.instance().removeMapLayer(existing_fold.id())
-
-        lay.append(fold_layer)
+        self.replaceLayerInLay('fold_map', fold_layer)
         self.actShowFoldLayer.setChecked(True)
         self.showVisibleMapLayers()
 
@@ -1283,19 +1497,6 @@ class MainWindow(QMainWindow):
     def computeAzimuthMap(self):
         """ Compute an azimuth map (mean source-receiver azimuth per CMP bin)
         from the 'nodes' (receivers) and 'shots' (sources) layers. """
-
-        nodes_layer = next((x for x in lay if x.name() == 'nodes'), None)
-        shots_layer = next((x for x in lay if x.name() == 'shots'), None)
-
-        if not nodes_layer or not shots_layer:
-            QMessageBox.warning(self, "Azimuth Map",
-                "Carregue as camadas de Nodes e Shots antes de calcular o azimute.")
-            return
-
-        if not nodes_layer.isValid() or not shots_layer.isValid():
-            QMessageBox.warning(self, "Azimuth Map",
-                "As camadas de Nodes e/ou Shots nao sao validas.")
-            return
 
         bin_size, ok1 = QInputDialog.getDouble(self, "Azimuth Map",
             "Tamanho do bin (m):", 100.0, 1.0, 100000.0, 1)
@@ -1317,83 +1518,36 @@ class MainWindow(QMainWindow):
                 "Offset minimo deve ser menor que o offset maximo.")
             return
 
-        node_pts = [f.geometry().asPoint() for f in nodes_layer.getFeatures()
-                   if f.geometry() and not f.geometry().isEmpty()]
-        shot_pts = [f.geometry().asPoint() for f in shots_layer.getFeatures()
-                   if f.geometry() and not f.geometry().isEmpty()]
+        pairs, canceled, err = self.getSourceReceiverPairs(
+            min_offset, max_offset, "Calculando mapa de azimute...")
 
-        if not node_pts or not shot_pts:
-            QMessageBox.warning(self, "Azimuth Map",
-                "As camadas de Nodes/Shots estao vazias.")
+        if err:
+            QMessageBox.warning(self, "Azimuth Map", err)
             return
-
-        # spatial index on the nodes, so for each shot we only test nearby nodes
-        index = QgsSpatialIndex()
-        node_feats = []
-        for i, p in enumerate(node_pts):
-            feat = QgsFeature(i)
-            feat.setGeometry(QgsGeometry.fromPointXY(p))
-            node_feats.append(feat)
-            index.insertFeature(feat)
-
-        all_x = [p.x() for p in node_pts] + [p.x() for p in shot_pts]
-        all_y = [p.y() for p in node_pts] + [p.y() for p in shot_pts]
-        xmin, xmax = min(all_x), max(all_x)
-        ymin, ymax = min(all_y), max(all_y)
-
-        # (col, row) -> [sum_sin, sum_cos, count]  (circular accumulation)
-        azimuth_grid = {}
-
-        progress = QProgressDialog("Calculando mapa de azimute...", "Cancelar", 0, len(shot_pts), self)
-        progress.setWindowTitle("Azimuth Map")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-
-        canceled = False
-        for i, sp in enumerate(shot_pts):
-            if i % 20 == 0:
-                progress.setValue(i)
-                if progress.wasCanceled():
-                    canceled = True
-                    break
-            rect = QgsRectangle(sp.x() - max_offset, sp.y() - max_offset,
-                                sp.x() + max_offset, sp.y() + max_offset)
-            for nid in index.intersects(rect):
-                np_ = node_pts[nid]
-                dx = np_.x() - sp.x()
-                dy = np_.y() - sp.y()
-                offset = math.hypot(dx, dy)
-                if offset > max_offset or offset < min_offset:
-                    continue
-                mx = (sp.x() + np_.x()) / 2.0
-                my = (sp.y() + np_.y()) / 2.0
-                col = int((mx - xmin) / bin_size)
-                row = int((my - ymin) / bin_size)
-                key = (col, row)
-
-                azimuth = math.degrees(math.atan2(dx, dy))
-                if azimuth < 0:
-                    azimuth += 360.0
-                rad = math.radians(azimuth)
-
-                if key not in azimuth_grid:
-                    azimuth_grid[key] = [0.0, 0.0, 0]
-                acc = azimuth_grid[key]
-                acc[0] += math.sin(rad)
-                acc[1] += math.cos(rad)
-                acc[2] += 1
-
-        progress.setValue(len(shot_pts))
-
         if canceled:
             QMessageBox.information(self, "Azimuth Map", "Calculo cancelado.")
             return
-
-        if not azimuth_grid:
+        if not pairs:
             QMessageBox.information(self, "Azimuth Map",
                 "Nenhum par fonte-receptor encontrado na faixa de offset [%s, %s] m."
                 % (min_offset, max_offset))
             return
+
+        xmin, xmax, ymin, ymax = self.cmp_extent
+
+        # (col, row) -> [sum_sin, sum_cos, count]  (circular accumulation)
+        azimuth_grid = {}
+        for mx, my, offset, azimuth in pairs:
+            col = int((mx - xmin) / bin_size)
+            row = int((my - ymin) / bin_size)
+            key = (col, row)
+            rad = math.radians(azimuth)
+            if key not in azimuth_grid:
+                azimuth_grid[key] = [0.0, 0.0, 0]
+            acc = azimuth_grid[key]
+            acc[0] += math.sin(rad)
+            acc[1] += math.cos(rad)
+            acc[2] += 1
 
         azimuth_layer = QgsVectorLayer(
             "Polygon?crs=epsg:31983&field=azimuth:double", "azimuth_map", "memory")
@@ -1436,19 +1590,6 @@ class MainWindow(QMainWindow):
         (sources) layers, and show it as an offset-azimuth polar diagram
         (rings = offset, color = fold count). """
 
-        nodes_layer = next((x for x in lay if x.name() == 'nodes'), None)
-        shots_layer = next((x for x in lay if x.name() == 'shots'), None)
-
-        if not nodes_layer or not shots_layer:
-            QMessageBox.warning(self, "Fold Rose",
-                "Carregue as camadas de Nodes e Shots antes de calcular.")
-            return
-
-        if not nodes_layer.isValid() or not shots_layer.isValid():
-            QMessageBox.warning(self, "Fold Rose",
-                "As camadas de Nodes e/ou Shots nao sao validas.")
-            return
-
         n_sectors, ok0 = QInputDialog.getInt(self, "Fold Rose",
             "Numero de setores de azimute:", 16, 4, 72, 4)
         if not ok0:
@@ -1474,71 +1615,31 @@ class MainWindow(QMainWindow):
                 "Offset minimo deve ser menor que o offset maximo.")
             return
 
-        node_pts = [f.geometry().asPoint() for f in nodes_layer.getFeatures()
-                   if f.geometry() and not f.geometry().isEmpty()]
-        shot_pts = [f.geometry().asPoint() for f in shots_layer.getFeatures()
-                   if f.geometry() and not f.geometry().isEmpty()]
+        pairs, canceled, err = self.getSourceReceiverPairs(
+            min_offset, max_offset, "Calculando fold rose...")
 
-        if not node_pts or not shot_pts:
-            QMessageBox.warning(self, "Fold Rose",
-                "As camadas de Nodes/Shots estao vazias.")
+        if err:
+            QMessageBox.warning(self, "Fold Rose", err)
             return
-
-        index = QgsSpatialIndex()
-        node_feats = []
-        for i, p in enumerate(node_pts):
-            feat = QgsFeature(i)
-            feat.setGeometry(QgsGeometry.fromPointXY(p))
-            node_feats.append(feat)
-            index.insertFeature(feat)
-
-        sector_width = 360.0 / n_sectors
-        ring_width = (max_offset - min_offset) / n_rings
-
-        # counts[ring][sector] -> fold count
-        counts = [[0] * n_sectors for _ in range(n_rings)]
-
-        progress = QProgressDialog("Calculando fold rose...", "Cancelar", 0, len(shot_pts), self)
-        progress.setWindowTitle("Fold Rose")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-
-        canceled = False
-        for i, sp in enumerate(shot_pts):
-            if i % 20 == 0:
-                progress.setValue(i)
-                if progress.wasCanceled():
-                    canceled = True
-                    break
-            rect = QgsRectangle(sp.x() - max_offset, sp.y() - max_offset,
-                                sp.x() + max_offset, sp.y() + max_offset)
-            for nid in index.intersects(rect):
-                np_ = node_pts[nid]
-                dx = np_.x() - sp.x()
-                dy = np_.y() - sp.y()
-                offset = math.hypot(dx, dy)
-                if offset > max_offset or offset < min_offset:
-                    continue
-                azimuth = math.degrees(math.atan2(dx, dy))
-                if azimuth < 0:
-                    azimuth += 360.0
-                sector = int(azimuth / sector_width) % n_sectors
-                ring = int((offset - min_offset) / ring_width)
-                if ring >= n_rings:
-                    ring = n_rings - 1
-                counts[ring][sector] += 1
-
-        progress.setValue(len(shot_pts))
-
         if canceled:
             QMessageBox.information(self, "Fold Rose", "Calculo cancelado.")
             return
-
-        if sum(sum(r) for r in counts) == 0:
+        if not pairs:
             QMessageBox.information(self, "Fold Rose",
                 "Nenhum par fonte-receptor encontrado na faixa de offset [%s, %s] m."
                 % (min_offset, max_offset))
             return
+
+        sector_width = 360.0 / n_sectors
+        ring_width = (max_offset - min_offset) / n_rings
+
+        counts = [[0] * n_sectors for _ in range(n_rings)]   # counts[ring][sector]
+        for mx, my, offset, azimuth in pairs:
+            sector = int(azimuth / sector_width) % n_sectors
+            ring = int((offset - min_offset) / ring_width)
+            if ring >= n_rings:
+                ring = n_rings - 1
+            counts[ring][sector] += 1
 
         self.showFoldRoseDialog(counts, n_sectors, n_rings, min_offset, max_offset)
 
