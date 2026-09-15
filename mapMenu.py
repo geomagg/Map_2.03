@@ -32,6 +32,9 @@ CMP_HEADER_SIZE = struct.calcsize(CMP_HEADER_FMT)
 CMP_RECORD_FMT = '<4d'   # mx, my, offset, azimuth
 CMP_RECORD_SIZE = struct.calcsize(CMP_RECORD_FMT)
 
+APP_VERSION = "2.03"
+APP_PROJECT = "UFF / SHELL"
+
 HELP_HTML = """
 <h2>OBN Design -- Manual rapido</h2>
 <p>Ferramenta para desenho e QC de aquisicao sismica OBN: plotagem de nodes,
@@ -81,17 +84,20 @@ de nodes/shots/etc, pra nao precisar navegar toda vez.</li>
 <li><b>Gerar Nodes (grid no Poligono)</b> -- cria um grid regular de nodes
 dentro do poligono <i>pol2</i> (Node Polygon), a partir do espacamento entre
 nodes na linha (X), espacamento entre linhas (Y), e a direcao das linhas
-(azimute, 0 = Norte). Opcoes adicionais:
-  <ul>
-  <li><i>Incluir nodes na borda</i> -- inclui pontos que caem exatamente em
-  cima do contorno do poligono, alem do interior.</li>
-  <li><i>Alternar (escalonar) entre linhas</i> -- desloca as linhas
-  alternadas em metade do espacamento X (dx/2), gerando um padrao em
-  "tijolo" em vez de um grid retangular alinhado.</li>
-  </ul>
-O resultado e salvo como um novo <i>nodes.txt</i> (voce escolhe onde) e ja
-carregado automaticamente como a camada de nodes.</li>
+(azimute, 0 = Norte).</li>
+<li><b>Gerar Shots (grid no Poligono)</b> -- mesma coisa, mas dentro do
+poligono <i>polshot</i> (Shot Polygon), gerando a camada de shots.</li>
 </ul>
+<p>Ambas tem as mesmas opcoes adicionais:</p>
+<ul>
+<li><i>Incluir na borda</i> -- inclui pontos que caem exatamente em cima do
+contorno do poligono, alem do interior.</li>
+<li><i>Alternar (escalonar) entre linhas</i> -- desloca as linhas
+alternadas em metade do espacamento X (dx/2), gerando um padrao em
+"tijolo" em vez de um grid retangular alinhado.</li>
+</ul>
+<p>O resultado e salvo como um novo <i>nodes.txt</i>/<i>shots.txt</i> (voce
+escolhe onde) e ja carregado automaticamente como a respectiva camada.</p>
 
 <h3>Menu Computations</h3>
 <ul>
@@ -132,7 +138,7 @@ CMP cuida de deixar os calculos seguintes rapidos.</li>
 class MainWindow(QMainWindow):
     def __init__(self):
         QMainWindow.__init__(self)
-        self.setWindowTitle("OBN Design")
+        self.setWindowTitle("OBN Design v%s" % APP_VERSION)
         self.setGeometry(500, 500, 1400, 800)
         self.project = QgsProject()
         global curr_dir
@@ -625,12 +631,22 @@ class MainWindow(QMainWindow):
         designMenu.addAction(designNodesAct)
         designNodesAct.triggered.connect(self.designNodesGrid)
 
+        designShotsAct = QAction(QIcon(":/icons/polygon.png"), 'Gerar Shots (grid no Poligono)', self)
+        designShotsAct.setStatusTip('Generate a regular shots grid inside the polshot (Shot Polygon) boundary')
+        designMenu.addAction(designShotsAct)
+        designShotsAct.triggered.connect(self.designShotsGrid)
+
         # Help
         helpMenu = menubar.addMenu('&Help')
         helpAct = QAction(QIcon(":/icons/info.png"), 'Manual / Ajuda', self)
         helpAct.setStatusTip('Ver o manual de uso do programa')
         helpMenu.addAction(helpAct)
         helpAct.triggered.connect(self.showHelp)
+
+        aboutAct = QAction(QIcon(":/icons/info.png"), 'Sobre', self)
+        aboutAct.setStatusTip('Sobre este programa')
+        helpMenu.addAction(aboutAct)
+        aboutAct.triggered.connect(self.showAbout)
 
 # Tool bar
 
@@ -1287,6 +1303,17 @@ class MainWindow(QMainWindow):
         dialog.setLayout(layout)
         dialog.exec_()
 
+    def showAbout(self):
+        QMessageBox.about(self, "Sobre o OBN Design",
+            "<h3>OBN Design</h3>"
+            "<p>Versao %s</p>"
+            "<p>Desenvolvido no ambito do projeto <b>%s</b>.</p>"
+            "<p>Ferramenta para desenho e QC de aquisicao sismica OBN "
+            "(Ocean Bottom Node): plotagem de nodes, shots, sail lines e "
+            "poligonos de area; geracao de grid de nodes/shots; calculo de "
+            "fold, azimute e diagramas offset-azimute.</p>"
+            % (APP_VERSION, APP_PROJECT))
+
     def colorLayerDialog(self):
 
         col= QColorDialog.getColor()
@@ -1665,67 +1692,67 @@ class MainWindow(QMainWindow):
             "Arquivo CMP carregado (%s): %d pares, offset maximo = %s m"
             % (path, count, str(self.cmp_max_offset)))
 
-    def designNodesGrid(self):
-        """ Generate a regular nodes grid (spacing dx along the line, dy
-        between lines, at a given azimuth) clipped to the 'pol2' (Node
-        Polygon) boundary, and save/load it as a nodes.txt file. """
+    def _designGridInPolygon(self, poly_name, layer_name, title):
+        """ Generate a regular point grid (spacing dx along the line, dy
+        between lines, at a given azimuth) clipped to the given polygon
+        layer (poly_name), and save/load it as a <layer_name>.txt file.
+        Shared by Design > Gerar Nodes and Design > Gerar Shots. """
 
-        pol_layer = next((x for x in lay if x.name() == 'pol2'), None)
+        pol_layer = next((x for x in lay if x.name() == poly_name), None)
         if not pol_layer or not pol_layer.isValid():
-            QMessageBox.warning(self, "Design Nodes",
-                "Carregue o poligono de Nodes (pol2) antes de gerar o grid.")
+            QMessageBox.warning(self, title,
+                "Carregue o poligono de %s (%s) antes de gerar o grid." % (layer_name, poly_name))
             return
 
         feats = list(pol_layer.getFeatures())
         if not feats or not feats[0].geometry() or feats[0].geometry().isEmpty():
-            QMessageBox.warning(self, "Design Nodes",
-                "O poligono de Nodes (pol2) esta vazio ou invalido.")
+            QMessageBox.warning(self, title,
+                "O poligono de %s (%s) esta vazio ou invalido." % (layer_name, poly_name))
             return
         poly_geom = feats[0].geometry()
 
-        dx, ok1 = QInputDialog.getDouble(self, "Design Nodes",
-            "Espacamento entre nodes na linha - eixo X (m):", 400.0, 0.1, 100000.0, 1)
+        dx, ok1 = QInputDialog.getDouble(self, title,
+            "Espacamento entre %s na linha - eixo X (m):" % layer_name, 400.0, 0.1, 100000.0, 1)
         if not ok1:
             return
 
-        dy, ok2 = QInputDialog.getDouble(self, "Design Nodes",
-            "Espacamento entre linhas de nodes - eixo Y (m):", 400.0, 0.1, 100000.0, 1)
+        dy, ok2 = QInputDialog.getDouble(self, title,
+            "Espacamento entre linhas de %s - eixo Y (m):" % layer_name, 400.0, 0.1, 100000.0, 1)
         if not ok2:
             return
 
-        azimuth, ok3 = QInputDialog.getDouble(self, "Design Nodes",
-            "Direcao das linhas de nodes (azimute, graus, 0 = Norte):",
+        azimuth, ok3 = QInputDialog.getDouble(self, title,
+            "Direcao das linhas de %s (azimute, graus, 0 = Norte):" % layer_name,
             0.0, 0.0, 359.9, 1)
         if not ok3:
             return
 
-        start_line, ok4 = QInputDialog.getInt(self, "Design Nodes",
+        start_line, ok4 = QInputDialog.getInt(self, title,
             "Numero da primeira linha (L):", 1, 1, 999999, 1)
         if not ok4:
             return
 
-        start_station, ok5 = QInputDialog.getInt(self, "Design Nodes",
+        start_station, ok5 = QInputDialog.getInt(self, title,
             "Numero da primeira estacao (S):", 1, 1, 999999, 1)
         if not ok5:
             return
 
-        include_boundary = QMessageBox.question(self, "Design Nodes",
-            "Incluir nodes que caem exatamente em cima da linha do poligono?",
+        include_boundary = QMessageBox.question(self, title,
+            "Incluir %s que caem exatamente em cima da linha do poligono?" % layer_name,
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes
 
-        stagger = QMessageBox.question(self, "Design Nodes",
-            "Alternar (escalonar) os nodes entre uma linha e outra?\n"
-            "Linhas pares deslocadas em metade do espacamento (dx/2).",
+        stagger = QMessageBox.question(self, title,
+            "Alternar (escalonar) os %s entre uma linha e outra?\n"
+            "Linhas pares deslocadas em metade do espacamento (dx/2)." % layer_name,
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
 
         theta = math.radians(azimuth)
-        u = (math.sin(theta), math.cos(theta))     # along the node line (station direction, spaced by dx)
+        u = (math.sin(theta), math.cos(theta))     # along the line (station direction, spaced by dx)
         v = (math.cos(theta), -math.sin(theta))    # perpendicular (line direction, spaced by dy)
 
         verts = list(poly_geom.vertices())
         if not verts:
-            QMessageBox.warning(self, "Design Nodes",
-                "Nao foi possivel ler os vertices do poligono.")
+            QMessageBox.warning(self, title, "Nao foi possivel ler os vertices do poligono.")
             return
 
         bbox = poly_geom.boundingBox()
@@ -1750,15 +1777,15 @@ class MainWindow(QMainWindow):
 
         total_candidates = n_lines * n_stations
         if total_candidates > 500000:
-            reply = QMessageBox.question(self, "Design Nodes",
+            reply = QMessageBox.question(self, title,
                 "Essa configuracao vai testar aproximadamente %d pontos candidatos, "
                 "o que pode demorar bastante. Deseja continuar?" % total_candidates,
                 QMessageBox.Yes | QMessageBox.No)
             if reply != QMessageBox.Yes:
                 return
 
-        progress = QProgressDialog("Gerando grid de nodes...", "Cancelar", 0, n_lines, self)
-        progress.setWindowTitle("Design Nodes")
+        progress = QProgressDialog("Gerando grid de %s..." % layer_name, "Cancelar", 0, n_lines, self)
+        progress.setWindowTitle(title)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
 
@@ -1793,16 +1820,16 @@ class MainWindow(QMainWindow):
         progress.setValue(n_lines)
 
         if canceled:
-            QMessageBox.information(self, "Design Nodes", "Geracao cancelada.")
+            QMessageBox.information(self, title, "Geracao cancelada.")
             return
 
         if not rows:
-            QMessageBox.information(self, "Design Nodes",
-                "Nenhum node caiu dentro do poligono com esses parametros.")
+            QMessageBox.information(self, title,
+                "Nenhum ponto caiu dentro do poligono com esses parametros.")
             return
 
-        default_path = os.path.join(self.data_dir, "nodes_design.txt")
-        path, _ = QFileDialog.getSaveFileName(self, "Salvar nodes.txt gerado",
+        default_path = os.path.join(self.data_dir, "%s_design.txt" % layer_name)
+        path, _ = QFileDialog.getSaveFileName(self, "Salvar %s.txt gerado" % layer_name,
             default_path, "Text Files (*.txt)", options=QFileDialog.DontUseNativeDialog)
         if not path:
             return
@@ -1815,25 +1842,32 @@ class MainWindow(QMainWindow):
                 for x, y, s, l in rows:
                     f.write("%.2f %.2f %d %d\n" % (x, y, s, l))
         except Exception as e:
-            QMessageBox.warning(self, "Design Nodes", "Erro ao salvar: %s" % str(e))
+            QMessageBox.warning(self, title, "Erro ao salvar: %s" % str(e))
             return
 
         filename = "file://" + path
         uri = filename + "?delimiter=%s&crs=epsg:31983&LField=%s&SField=%s&xField=%s&yField=%s" % ("  ", "L", "S", "X", "Y")
-        new_layer = QgsVectorLayer(uri, "nodes", "delimitedtext")
+        new_layer = QgsVectorLayer(uri, layer_name, "delimitedtext")
         if not new_layer.isValid():
-            QMessageBox.warning(self, "Design Nodes",
-                "Nodes gerados e salvos em:\n%s\n\nmas nao foi possivel carregar automaticamente."
-                % path)
+            QMessageBox.warning(self, title,
+                "%s gerados e salvos em:\n%s\n\nmas nao foi possivel carregar automaticamente."
+                % (layer_name.capitalize(), path))
             return
 
-        self.replaceLayerInLay('nodes', new_layer)
-        self.actShowNodesLayer.setChecked(True)
+        self.replaceLayerInLay(layer_name, new_layer)
+        view_checkbox = self.actShowNodesLayer if layer_name == 'nodes' else self.actShowShotsLayer
+        view_checkbox.setChecked(True)
         self.showVisibleMapLayers()
 
-        QMessageBox.information(self, "Design Nodes",
-            "Grid de nodes gerado: %d nodes em %d linhas, dentro do poligono.\n\nSalvo em:\n%s"
-            % (len(rows), line_num - start_line, path))
+        QMessageBox.information(self, title,
+            "Grid de %s gerado: %d pontos em %d linhas, dentro do poligono.\n\nSalvo em:\n%s"
+            % (layer_name, len(rows), line_num - start_line, path))
+
+    def designNodesGrid(self):
+        self._designGridInPolygon('pol2', 'nodes', 'Design Nodes')
+
+    def designShotsGrid(self):
+        self._designGridInPolygon('polshot', 'shots', 'Design Shots')
 
     def computeFoldMap(self):
         """ Compute a fold map (CMP bin coverage) from the 'nodes' (receivers)
